@@ -68,7 +68,19 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 | Left / Right | Step one frame |
 | Home / End | Jump to start / end |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
+
 | Ctrl+I / Ctrl+O / Ctrl+S / Ctrl+E | Import / open / save / export |
+
+
+## Screenshots
+
+<img width="1920" height="1054" alt="RF2" src="https://github.com/user-attachments/assets/2ef8a94a-b44a-4712-b60b-d69b81296c65" />
+
+<img width="196" height="400" alt="rf3" src="https://github.com/user-attachments/assets/d4a377c4-96c2-45a0-a1b3-dcd559328cc0" />
+
+<img width="246" height="271" alt="rf4" src="https://github.com/user-attachments/assets/1b462f67-9de2-4396-adcd-cf2618e9284a" />
+
+<img width="359" height="444" alt="RF5" src="https://github.com/user-attachments/assets/274e9e59-f387-49c3-8f2f-402ad50d3832" />
 
 ## Known limitations (v0.3)
 
