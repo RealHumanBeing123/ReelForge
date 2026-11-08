@@ -495,6 +495,16 @@ impl Project {
         best.unwrap_or_else(|| self.free_start(track, desired, dur, ignore))
     }
 
+    /// Times worth snapping to: the timeline start plus every clip start / end (all tracks).
+    pub fn edge_points(&self, ignore: Option<u64>) -> Vec<f64> {
+        let mut v = vec![0.0];
+        for c in self.clips.iter().filter(|c| Some(c.id) != ignore) {
+            v.push(c.start);
+            v.push(c.end());
+        }
+        v
+    }
+
     /// End of the nearest clip on `track` that finishes at or before `start` (0 if none).
     pub fn gap_before(&self, track: usize, start: f64, ignore: Option<u64>) -> f64 {
         self.clips
@@ -604,4 +614,16 @@ impl Project {
             (even(short_side as f64), even(short_side as f64 * ph / pw))
         }
     }
+}
+
+/// The point closest to `t` that lies within `thr` of it, if any.
+pub fn nearest_within(points: impl IntoIterator<Item = f64>, t: f64, thr: f64) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for e in points {
+        let d = (e - t).abs();
+        if d <= thr && best.map_or(true, |b| d < (b - t).abs()) {
+            best = Some(e);
+        }
+    }
+    best
 }

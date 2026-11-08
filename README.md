@@ -26,7 +26,9 @@ The finished program is `target\release\reelforge.exe`.
   - Clips on **different tracks can overlap freely**. They are layered (upper track on top) and their audio is mixed.
 - **Per-clip volume** (0-200%) and **audio fade in / fade out**.
 - **Canvas presets** (16:9, 9:16, 1:1, 4:3) and frame rate.
-- **Save / open projects** (`.rforge`, JSON).
+- **Playhead snapping:** while you drag the playhead along the ruler it is pulled onto the start or end of any clip (and the timeline start) when it comes within about 20 pixels. A gold marker shows what it snapped to. Hold **Alt** to scrub freely. When you trim a clip's edge, it likewise snaps (about 10 pixels) to the playhead and to other clips' edges, so you can park the playhead on one clip's end and trim another clip to match its length.
+- **Save / open projects** (`.rforge`, JSON). The window title shows the project name and a `*` while there are unsaved changes.
+- **Unsaved-changes prompt:** closing the window (X, Alt+F4, or File > Exit) with unsaved changes asks whether to Save, Don't save, or Cancel. If the project is already saved, it closes straight away. Cancelling the save dialog keeps the program open.
 
 ### Titles
 - `+ Title` adds a text clip on the top track. Edit text, font (Segoe UI, Arial, Georgia, Impact, Consolas), size, colour and position (center / lower third / top).
@@ -68,9 +70,8 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 | Left / Right | Step one frame |
 | Home / End | Jump to start / end |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
-
 | Ctrl+I / Ctrl+O / Ctrl+S / Ctrl+E | Import / open / save / export |
-
+| Alt (while dragging the playhead) | Turn off snapping |
 
 ## Screenshots
 
@@ -82,13 +83,14 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 
 <img width="359" height="444" alt="RF5" src="https://github.com/user-attachments/assets/274e9e59-f387-49c3-8f2f-402ad50d3832" />
 
-## Known limitations (v0.3)
+## Known limitations (v0.4)
 
 - **This code has not been compiled or run on Windows by its author.** The FFmpeg commands it generates (export, preview, titles, recordings) were tested against FFmpeg 6.1 on Linux with synthetic inputs; the egui interface and the Windows capture devices (`gdigrab`, DirectShow) have not. Expect to fix a few compile errors on the first build.
 - Screen and voice recording use FFmpeg's `gdigrab` and DirectShow, so they work on Windows only. System-audio capture needs a loopback device such as "Stereo Mix", which many PCs have disabled by default.
 - ReelForge's own window is captured if you do not minimise it while recording a desktop or region.
 - Preview playback streams from FFmpeg with mixed audio through `rodio`. Audio and video start together but are not sample-locked, so expect small drift on long playbacks. Full HD preview can drop frames on slower machines.
 - Editing, seeking or stepping while playing stops playback.
+- The unsaved-changes prompt covers closing the program only. File > New and File > Open replace the current project without asking. Undoing back to the saved state still counts as changed.
 - Keyframe times are relative to the clip start. Trimming a clip's left edge does not shift them. Splitting a clip keeps animation continuous.
 - Starting playback in the middle of a fade/zoom-in skips that transition's ramp for that session.
 - Title fonts are loaded from `C:\Windows\Fonts`. Titles are written to temp files, so a user name containing an apostrophe in the temp path can break title rendering.

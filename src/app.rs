@@ -18,6 +18,10 @@ const TRACK_H: f32 = 54.0;
 const RULER_H: f32 = 24.0;
 const HEADER_W: f32 = 120.0;
 const MIN_CLIP: f64 = 0.1;
+/// Pull range (screen pixels) when scrubbing the playhead near a clip edge.
+const PLAYHEAD_SNAP_PX: f32 = 20.0;
+/// Pull range when trimming a clip edge near the playhead or another clip's edge.
+const EDGE_SNAP_PX: f32 = 10.0;
 const QUALITY: [(&str, u32); 4] = [("Draft 360p", 360), ("Standard 540p", 540), ("High 720p", 720), ("Full HD 1080p", 1080)];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +99,13 @@ pub struct ReelForge {
     edit_stamp: Option<(u64, Instant)>,
     preview_quality: u32,
 
+    revision: u64,
+    saved_revision: u64,
+    allow_close: bool,
+    close_prompt: bool,
+    snap_marker: Option<f64>,
+    last_title: String,
+
     rec_open: Option<RecKind>,
     rec_screen: RenderSettings,
     rec_voice: RenderSettings,
@@ -166,6 +177,12 @@ impl ReelForge {
             last_req_time: -1.0,
             edit_stamp: None,
             preview_quality: 720,
+            revision: 0,
+            saved_revision: 0,
+            allow_close: false,
+            close_prompt: false,
+            snap_marker: None,
+            last_title: String::new(),
             rec_open: None,
             rec_screen: RenderSettings { speed: Speed::Fast, short_side: 1080, ..RenderSettings::default() },
             rec_voice: RenderSettings { acodec: AudioCodec::Aac, audio_kbps: 192, ..RenderSettings::default() },
@@ -196,7 +213,12 @@ impl ReelForge {
 
     // ---------------------------------------------------------------- state helpers
 
+    fn is_dirty(&self) -> bool {
+        self.revision != self.saved_revision
+    }
+
     fn push_undo(&mut self) {
+        self.revision += 1;
         self.stop_playback();
         self.undo.push(self.project.clone());
         if self.undo.len() > 100 {
@@ -221,6 +243,7 @@ impl ReelForge {
     }
 
     fn after_history_change(&mut self) {
+        self.revision += 1;
         if let Some(id) = self.selected {
             if self.project.clip(id).is_none() {
                 self.selected = None;
@@ -294,6 +317,7 @@ impl ReelForge {
         }
         let coalesce = matches!(self.edit_stamp, Some((id, at)) if id == new.id && at.elapsed().as_millis() < 700);
         if coalesce {
+            self.revision += 1;
             self.preview_dirty = true;
             self.stop_playback();
         } else {
@@ -345,7 +369,9 @@ impl ReelForge {
         }
     }
 
-    fn save_project(&mut self, as_new: bool) {
+    /// Returns true when the project was written to disk.
+    fn save_project(&mut self, as_new: bool) -> bool {
+        let mut saved = false;
         let path = if as_new || self.project_path.is_none() {
             rfd::FileDialog::new().add_filter("ReelForge project", &["rforge"]).set_file_name("project.rforge").save_file()
         } else {
@@ -356,10 +382,13 @@ impl ReelForge {
                 Ok(()) => {
                     self.status = format!("Saved {}", p.display());
                     self.project_path = Some(p);
+                    self.saved_revision = self.revision;
+                    saved = true;
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
         }
+        saved
     }
 
     fn open_project(&mut self, ctx: &egui::Context) {
@@ -387,6 +416,8 @@ impl ReelForge {
     fn new_project(&mut self) {
         self.project = Project::default();
         self.project_path = None;
+        self.revision = 0;
+        self.saved_revision = 0;
         self.undo.clear();
         self.redo.clear();
         self.thumbs.clear();
@@ -409,6 +440,7 @@ impl ReelForge {
                     let add_now = self.pending_add.as_ref() == Some(&m.path);
                     let new_id = m.id;
                     self.project.media.push(m);
+                    self.revision += 1;
                     if add_now {
                         self.pending_add = None;
                         self.push_undo();
@@ -658,6 +690,11 @@ impl ReelForge {
                     }
                     if ui.button("Export...   Ctrl+E").clicked() {
                         self.export_open = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Exit").clicked() {
+                        self.request_exit(ctx);
                         ui.close_menu();
                     }
                 });
@@ -1017,6 +1054,13 @@ impl ReelForge {
 
     // ---------------------------------------------------------------- UI: timeline
 
+    /// Snap a trimmed edge to the playhead or another clip's edge within EDGE_SNAP_PX.
+    fn snap_edge(&self, t: f64, ignore: u64) -> f64 {
+        let mut pts = self.project.edge_points(Some(ignore));
+        pts.push(self.playhead);
+        nearest_within(pts, t, (EDGE_SNAP_PX / self.pps) as f64).unwrap_or(t)
+    }
+
     fn snap(&self, t: f64, dur: f64, ignore: u64) -> f64 {
         let thr = 8.0 / self.pps as f64;
         let mut cands: Vec<f64> = vec![0.0, self.playhead];
@@ -1125,8 +1169,16 @@ impl ReelForge {
         if ruler_resp.dragged() || ruler_resp.clicked() {
             if let Some(p) = ruler_resp.interact_pointer_pos() {
                 self.stop_playback();
-                self.playhead = (scroll + ((p.x - lane_left) as f64 / pps)).max(0.0);
+                let raw = (scroll + ((p.x - lane_left) as f64 / pps)).max(0.0);
+                // Pull to the nearest clip start/end within PLAYHEAD_SNAP_PX; hold Alt to scrub freely.
+                let free = ui.input(|i| i.modifiers.alt);
+                let hit = if free { None } else { nearest_within(self.project.edge_points(None), raw, (PLAYHEAD_SNAP_PX / self.pps) as f64) };
+                self.playhead = hit.unwrap_or(raw);
+                self.snap_marker = hit;
             }
+        }
+        if ruler_resp.drag_stopped() || ruler_resp.clicked() {
+            self.snap_marker = None;
         }
 
         // track rows (highest track on top)
@@ -1273,6 +1325,16 @@ impl ReelForge {
             }
         }
 
+        // snap indicator while the playhead is pulled onto a clip edge
+        if let Some(mt) = self.snap_marker {
+            let mx = tx(mt, scroll);
+            if mx >= lane_left && mx <= rect.right() {
+                let gold = Color32::from_rgb(255, 215, 90);
+                painter.line_segment([Pos2::new(mx, rect.top()), Pos2::new(mx, rect.bottom())], Stroke::new(1.0, gold));
+                painter.circle_filled(Pos2::new(mx, rect.top() + RULER_H - 6.0), 4.0, gold);
+            }
+        }
+
         // playhead
         let px = tx(self.playhead, scroll);
         if px >= lane_left && px <= rect.right() {
@@ -1319,7 +1381,8 @@ impl ReelForge {
                 }
             }
             DragKind::TrimL => {
-                let mut delta = acc;
+                let snapped = self.snap_edge(orig.start + acc, orig.id);
+                let mut delta = snapped - orig.start;
                 let mut min_d = if is_image { -orig.start } else { (-orig.in_point).max(-orig.start) };
                 // can't trim past the end of the previous clip on this track
                 min_d = min_d.max(self.project.gap_before(orig.track, orig.start, Some(orig.id)) - orig.start);
@@ -1336,7 +1399,7 @@ impl ReelForge {
                 let mut max_dur = if is_image { f64::MAX } else { m.duration - orig.in_point };
                 // can't extend into the next clip on this track
                 max_dur = max_dur.min(self.project.gap_after(orig.track, orig.end(), Some(orig.id)) - orig.start);
-                let dur = (orig.duration + acc).clamp(MIN_CLIP, max_dur.max(MIN_CLIP));
+                let dur = (self.snap_edge(orig.end() + acc, orig.id) - orig.start).clamp(MIN_CLIP, max_dur.max(MIN_CLIP));
                 if let Some(c) = self.project.clip_mut(orig.id) {
                     c.duration = dur;
                 }
@@ -1578,6 +1641,55 @@ impl ReelForge {
         }
         if !open && !busy {
             self.rec_open = None;
+        }
+    }
+
+    fn close_now(&mut self, ctx: &egui::Context) {
+        self.allow_close = true;
+        self.close_prompt = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Exit menu item / window close: ask first when there are unsaved changes.
+    fn request_exit(&mut self, ctx: &egui::Context) {
+        if self.is_dirty() {
+            self.close_prompt = true;
+        } else {
+            self.close_now(ctx);
+        }
+    }
+
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.close_prompt {
+            return;
+        }
+        let mut choice: Option<u8> = None; // 0 save, 1 discard, 2 cancel
+        egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.label("This project has unsaved changes.");
+            ui.label("Do you want to save it before closing?");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("  Save  ").clicked() {
+                    choice = Some(0);
+                }
+                if ui.button("  Don't save  ").clicked() {
+                    choice = Some(1);
+                }
+                if ui.button("  Cancel  ").clicked() {
+                    choice = Some(2);
+                }
+            });
+        });
+        match choice {
+            // Only close once the file really was written; a cancelled or failed save keeps the prompt.
+            Some(0) => {
+                if self.save_project(false) {
+                    self.close_now(ctx);
+                }
+            }
+            Some(1) => self.close_now(ctx),
+            Some(2) => self.close_prompt = false,
+            _ => {}
         }
     }
 
@@ -1968,6 +2080,18 @@ fn elide(s: &str, max: usize) -> String {
 
 impl eframe::App for ReelForge {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Window close button / Alt+F4: intercept when there is unsaved work.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.is_dirty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_prompt = true;
+        }
+        let name = self.project_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".to_string());
+        let title = format!("{}{} - ReelForge", name, if self.is_dirty() { " *" } else { "" });
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
+
         self.poll(ctx);
         self.poll_recorder(ctx);
         self.handle_drops(ctx);
@@ -1982,6 +2106,7 @@ impl eframe::App for ReelForge {
         self.preview_panel(ctx);
         self.export_window(ctx);
         self.record_window(ctx);
+        self.close_dialog(ctx);
         self.finish_media_drag(ctx);
 
         if self.preview_inflight || self.render_rx.is_some() {
