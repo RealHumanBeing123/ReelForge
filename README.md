@@ -1,6 +1,6 @@
 # ReelForge
 
-A lightweight timeline video editor for Windows, written in Rust. Layout follows Camtasia: media bin on the left, preview in the centre, properties on the right, a full-width multi-track timeline along the bottom, and Export top-right.
+A lightweight timeline video editor for Windows, written in Rust. Layout is as follows: media bin on the left, preview in the centre, properties on the right, a full-width multi-track timeline along the bottom, and Export top-right.
 
 ## Build
 
