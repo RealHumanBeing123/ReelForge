@@ -97,6 +97,10 @@ pub struct ReelForge {
     preview_dirty: bool,
     last_req_time: f64,
     edit_stamp: Option<(u64, Instant)>,
+    freeze_len: f64,
+    range_from: f64,
+    range_to: f64,
+    range_speed: f64,
     preview_quality: u32,
 
     revision: u64,
@@ -176,6 +180,10 @@ impl ReelForge {
             preview_dirty: true,
             last_req_time: -1.0,
             edit_stamp: None,
+            freeze_len: 2.0,
+            range_from: 0.0,
+            range_to: 1.0,
+            range_speed: 2.0,
             preview_quality: 720,
             revision: 0,
             saved_revision: 0,
@@ -275,6 +283,34 @@ impl ReelForge {
         }
     }
 
+    /// Insert a freeze frame of the clip under the playhead (selected clip first).
+    fn freeze_at_playhead(&mut self) {
+        let t = self.playhead;
+        let ok = |c: &&Clip| c.title.is_none() && !c.freeze && t >= c.start && t <= c.end();
+        let target = self
+            .selected
+            .and_then(|id| self.project.clip(id))
+            .filter(ok)
+            .map(|c| c.id)
+            .or_else(|| self.project.clips.iter().filter(ok).filter(|c| self.project.media(c.media_id).map_or(false, |m| m.kind == MediaKind::Video)).max_by_key(|c| c.track).map(|c| c.id));
+        match target {
+            Some(id) => {
+                self.push_undo();
+                match self.project.insert_freeze(id, t, self.freeze_len.max(0.1)) {
+                    Some(f) => {
+                        self.selected = Some(f);
+                        self.status = format!("Freeze frame added ({:.1} s). Later clips on the track moved right.", self.freeze_len);
+                    }
+                    None => {
+                        self.undo.pop();
+                        self.status = "Can't freeze this clip here.".into();
+                    }
+                }
+            }
+            None => self.status = "Park the playhead over a video clip to freeze its frame.".into(),
+        }
+    }
+
     fn delete_selected(&mut self) {
         if let Some(id) = self.selected.take() {
             self.push_undo();
@@ -298,6 +334,15 @@ impl ReelForge {
                 video_codec: String::new(),
                 audio_codec: String::new(),
             });
+        }
+        if c.freeze {
+            // Image-like (any length) but keeps the source id so the timeline shows its thumbnail.
+            let mut m = self.project.media(c.media_id).cloned()?;
+            m.name = format!("Freeze: {}", m.name);
+            m.kind = MediaKind::Image;
+            m.duration = c.duration;
+            m.has_audio = false;
+            return Some(m);
         }
         self.project.media(c.media_id).cloned()
     }
@@ -325,6 +370,12 @@ impl ReelForge {
         }
         self.edit_stamp = Some((new.id, Instant::now()));
         let id = new.id;
+        // Changing a clip's length from the properties panel (speed, freeze length) ripples the
+        // clips after it on the same track so nothing overlaps.
+        let delta = new.duration - orig.duration;
+        if delta.abs() > 1e-9 && (new.start - orig.start).abs() < 1e-9 {
+            self.project.shift_after(new.track, orig.end() - 1e-6, delta, Some(id));
+        }
         if let Some(c) = self.project.clip_mut(id) {
             *c = new;
         }
@@ -531,6 +582,9 @@ impl ReelForge {
         if consume(none, Key::S) {
             self.split_at_playhead();
         }
+        if consume(none, Key::F) {
+            self.freeze_at_playhead();
+        }
         if consume(none, Key::Delete) || consume(none, Key::Backspace) {
             self.delete_selected();
         }
@@ -712,6 +766,10 @@ impl ReelForge {
                         self.split_at_playhead();
                         ui.close_menu();
                     }
+                    if ui.button("Freeze frame at playhead   F").clicked() {
+                        self.freeze_at_playhead();
+                        ui.close_menu();
+                    }
                     if ui.button("Delete clip   Del").clicked() {
                         self.delete_selected();
                         ui.close_menu();
@@ -848,7 +906,8 @@ impl ReelForge {
                     let mut c = orig.clone();
                     let media = self.media_for(&c);
                     let playhead_rel = self.playhead - c.start;
-                    let (mut do_split, mut do_delete) = (false, false);
+                    let (mut do_split, mut do_delete, mut do_freeze) = (false, false, false);
+                    let mut do_range: Option<(f64, f64, f64)> = None;
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         ui.label(egui::RichText::new(media.as_ref().map(|m| m.name.clone()).unwrap_or_default()).strong());
                         ui.add_space(4.0);
@@ -857,7 +916,12 @@ impl ReelForge {
                             ui.label(fmt_time(c.start));
                             ui.end_row();
                             ui.label("Duration");
-                            ui.label(fmt_time(c.duration));
+                            let free_len = c.freeze || c.title.is_some() || media.as_ref().map_or(false, |m| m.kind == MediaKind::Image);
+                            if free_len {
+                                ui.add(egui::DragValue::new(&mut c.duration).speed(0.05).range(MIN_CLIP..=3600.0).suffix(" s"));
+                            } else {
+                                ui.label(fmt_time(c.duration));
+                            }
                             ui.end_row();
                         });
                         if media.as_ref().map_or(false, |m| m.has_audio && m.kind != MediaKind::Image) {
@@ -875,6 +939,67 @@ impl ReelForge {
                             egui::CollapsingHeader::new("Title").default_open(true).show(ui, |ui| title_editor(ui, t));
                         }
                         let is_audio = media.as_ref().map_or(false, |m| m.kind == MediaKind::Audio);
+                        let is_video = media.as_ref().map_or(false, |m| m.kind == MediaKind::Video) && c.title.is_none() && !c.freeze;
+                        if is_video || (is_audio && c.title.is_none()) {
+                            egui::CollapsingHeader::new("Speed & direction").id_salt("speed").default_open(true).show(ui, |ui| {
+                                let mut sp = c.speed;
+                                if ui.add(egui::Slider::new(&mut sp, 0.1..=16.0).logarithmic(true).suffix("x").text("Speed")).changed() {
+                                    // keep the same stretch of source: length scales inversely with speed
+                                    c.duration = (orig.duration * orig.speed / sp).max(MIN_CLIP);
+                                    c.speed = sp;
+                                }
+                                ui.horizontal(|ui| {
+                                    for v in [0.25, 0.5, 1.0, 2.0, 4.0] {
+                                        if ui.small_button(format!("{v}x")).clicked() {
+                                            c.duration = (orig.duration * orig.speed / v).max(MIN_CLIP);
+                                            c.speed = v;
+                                        }
+                                    }
+                                });
+                                ui.checkbox(&mut c.reverse, "Reverse (play backwards)");
+                                ui.label(egui::RichText::new("Speed changes the whole clip. Later clips on this track move to make room. Audio is sped up / slowed with it.").weak().small());
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Change speed between two points").strong());
+                                let (lo, hi) = (c.start, c.end());
+                                let (mut a, mut b) = (self.range_from.clamp(lo, hi), self.range_to.clamp(lo, hi));
+                                ui.horizontal(|ui| {
+                                    ui.label("From");
+                                    ui.add(egui::DragValue::new(&mut a).speed(0.05).range(lo..=hi).suffix(" s"));
+                                    if ui.small_button("Playhead").clicked() {
+                                        a = self.playhead.clamp(lo, hi);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("To    ");
+                                    ui.add(egui::DragValue::new(&mut b).speed(0.05).range(lo..=hi).suffix(" s"));
+                                    if ui.small_button("Playhead").clicked() {
+                                        b = self.playhead.clamp(lo, hi);
+                                    }
+                                });
+                                self.range_from = a;
+                                self.range_to = b;
+                                ui.add(egui::Slider::new(&mut self.range_speed, 0.1..=16.0).logarithmic(true).suffix("x").text("Speed"));
+                                if ui.button("Apply to range").clicked() {
+                                    do_range = Some((a, b, self.range_speed));
+                                }
+                                ui.label(egui::RichText::new("Splits the clip at both points and changes only the part between them.").weak().small());
+                            });
+                        }
+                        if is_video {
+                            egui::CollapsingHeader::new("Freeze frame").id_salt("freeze").default_open(true).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Hold for");
+                                    ui.add(egui::DragValue::new(&mut self.freeze_len).speed(0.05).range(0.1..=60.0).suffix(" s"));
+                                });
+                                if ui.button("Freeze frame at playhead").clicked() {
+                                    do_freeze = true;
+                                }
+                                ui.label(egui::RichText::new("Splits the clip at the playhead and holds that picture. Later clips move right. Audio is silent during the hold.").weak().small());
+                            });
+                        }
+                        if c.freeze {
+                            ui.label(egui::RichText::new("Freeze frame: drag the clip's edges or set Duration to change how long it holds.").weak().small());
+                        }
                         if !is_audio {
                             let max_d = (c.duration / 2.0).clamp(0.2, 3.0);
                             egui::CollapsingHeader::new("Transitions").default_open(true).show(ui, |ui| {
@@ -897,6 +1022,22 @@ impl ReelForge {
                     self.commit_clip_edit(&orig, c);
                     if do_split {
                         self.split_at_playhead();
+                    }
+                    if do_freeze {
+                        self.freeze_at_playhead();
+                    }
+                    if let Some((a, b, sp)) = do_range {
+                        self.push_undo();
+                        match self.project.apply_speed_range(id, a, b, sp) {
+                            Some(mid) => {
+                                self.selected = Some(mid);
+                                self.status = format!("Speed {sp:.2}x applied to the selected range.");
+                            }
+                            None => {
+                                self.undo.pop();
+                                self.status = "Pick a range at least 0.05 s long inside the clip.".into();
+                            }
+                        }
                     }
                     if do_delete {
                         self.delete_selected();
@@ -1235,6 +1376,7 @@ impl ReelForge {
                 match m.kind {
                 MediaKind::Video => Color32::from_rgb(52, 105, 170),
                 MediaKind::Audio => Color32::from_rgb(55, 140, 95),
+                MediaKind::Image if c.freeze => Color32::from_rgb(70, 150, 165),
                 MediaKind::Image => Color32::from_rgb(150, 100, 50),
                 }
             };
@@ -1247,7 +1389,17 @@ impl ReelForge {
                 }
             }
             let label_pos = Pos2::new((r.left().max(lane_left)) + 6.0, r.top() + 12.0);
-            lane_painter.text(label_pos, Align2::LEFT_CENTER, &m.name, FontId::proportional(11.0), Color32::WHITE);
+            let mut label = m.name.clone();
+            if (c.speed - 1.0).abs() > 1e-6 {
+                label.push_str(&format!("  {}x", (c.speed * 100.0).round() / 100.0));
+            }
+            if c.reverse {
+                label.push_str("  (rev)");
+            }
+            if c.effects.iter().any(|e| matches!(e, Effect::Zoom { .. })) {
+                label.push_str("  [zoom]");
+            }
+            lane_painter.text(label_pos, Align2::LEFT_CENTER, &label, FontId::proportional(11.0), Color32::WHITE);
             // transition ramps
             for (tr, is_in) in [(c.transition_in, true), (c.transition_out, false)] {
                 if tr.kind == TransitionKind::None {
@@ -1383,25 +1535,42 @@ impl ReelForge {
             DragKind::TrimL => {
                 let snapped = self.snap_edge(orig.start + acc, orig.id);
                 let mut delta = snapped - orig.start;
-                let mut min_d = if is_image { -orig.start } else { (-orig.in_point).max(-orig.start) };
+                let sp = orig.speed.max(0.01);
+                let mut min_d = if is_image {
+                    -orig.start
+                } else if orig.reverse {
+                    (orig.duration - (m.duration - orig.in_point) / sp).max(-orig.start)
+                } else {
+                    (-orig.in_point / sp).max(-orig.start)
+                };
                 // can't trim past the end of the previous clip on this track
                 min_d = min_d.max(self.project.gap_before(orig.track, orig.start, Some(orig.id)) - orig.start);
                 delta = delta.clamp(min_d, orig.duration - MIN_CLIP);
                 if let Some(c) = self.project.clip_mut(orig.id) {
                     c.start = orig.start + delta;
                     c.duration = orig.duration - delta;
-                    if !is_image {
-                        c.in_point = orig.in_point + delta;
+                    if !is_image && !orig.reverse {
+                        c.in_point = orig.in_point + delta * sp;
                     }
                 }
             }
             DragKind::TrimR => {
-                let mut max_dur = if is_image { f64::MAX } else { m.duration - orig.in_point };
+                let sp = orig.speed.max(0.01);
+                let mut max_dur = if is_image {
+                    f64::MAX
+                } else if orig.reverse {
+                    orig.duration + orig.in_point / sp
+                } else {
+                    (m.duration - orig.in_point) / sp
+                };
                 // can't extend into the next clip on this track
                 max_dur = max_dur.min(self.project.gap_after(orig.track, orig.end(), Some(orig.id)) - orig.start);
                 let dur = (self.snap_edge(orig.end() + acc, orig.id) - orig.start).clamp(MIN_CLIP, max_dur.max(MIN_CLIP));
                 if let Some(c) = self.project.clip_mut(orig.id) {
                     c.duration = dur;
+                    if !is_image && orig.reverse {
+                        c.in_point = (orig.in_point - (dur - orig.duration) * sp).max(0.0);
+                    }
                 }
             }
         }
@@ -2016,6 +2185,14 @@ fn effects_editor(ui: &mut egui::Ui, effects: &mut Vec<Effect>) {
                 });
                 ui.add(egui::Slider::new(similarity, 0.01..=0.5).text("Similarity"));
                 ui.add(egui::Slider::new(blend, 0.0..=0.5).text("Edge blend"));
+            }
+            Effect::Zoom { from, to, fx, fy, ease } => {
+                ui.add(egui::Slider::new(from, 0.25..=4.0).suffix("x").text("Start zoom"));
+                ui.add(egui::Slider::new(to, 0.25..=4.0).suffix("x").text("End zoom"));
+                ui.add(egui::Slider::new(fx, 0.0..=1.0).text("Focus X"));
+                ui.add(egui::Slider::new(fy, 0.0..=1.0).text("Focus Y"));
+                ui.checkbox(ease, "Smooth start / end");
+                ui.label(egui::RichText::new("Zooms steadily over the whole clip. The focus point stays fixed on screen.").weak().small());
             }
             _ => {}
         }

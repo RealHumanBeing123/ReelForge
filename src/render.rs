@@ -282,18 +282,50 @@ fn effect_filter(e: &Effect) -> String {
         Effect::ChromaKey { color, similarity, blend } => {
             format!("chromakey=color={}:similarity={similarity:.3}:blend={blend:.3}", hex(*color))
         }
+        // Zoom is applied through the layer's dynamic scale and overlay position, not a filter.
+        Effect::Zoom { .. } => String::new(),
     }
 }
 
 /// Filters applied to one video layer (after its source), plus overlay x / y expressions.
 fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>, String, String) {
-    let mut v: Vec<String> = vec!["setpts=PTS-STARTPTS".to_string(), format!("fps={fps}")];
-    if fit {
-        v.push(format!("scale={rw}:{rh}:force_original_aspect_ratio=decrease:flags=lanczos"));
-        v.push("setsar=1".to_string());
+    let fit_scale = format!("scale={rw}:{rh}:force_original_aspect_ratio=decrease:flags=lanczos");
+    let mut v: Vec<String>;
+    if c.freeze {
+        // One source frame, held for the whole clip.
+        v = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
+        if fit {
+            v.push(fit_scale);
+            v.push("setsar=1".to_string());
+        }
+        v.push(format!("tpad=stop_mode=clone:stop_duration={:.3}", c.duration + 1.0));
+        v.push(format!("fps={fps}"));
+        v.push(format!("trim=duration={:.3}", c.duration));
+        v.push("setpts=PTS-STARTPTS".to_string());
+    } else if c.reverse || (c.speed - 1.0).abs() > 1e-6 {
+        // Fit first so `reverse` buffers small frames, then retime.
+        v = vec!["setpts=PTS-STARTPTS".to_string()];
+        if fit {
+            v.push(fit_scale);
+            v.push("setsar=1".to_string());
+        }
+        if c.reverse {
+            v.push("reverse".to_string());
+        }
+        v.push(format!("setpts=PTS/{:.6}", c.speed.max(0.01)));
+        v.push(format!("fps={fps}"));
+    } else {
+        v = vec!["setpts=PTS-STARTPTS".to_string(), format!("fps={fps}")];
+        if fit {
+            v.push(fit_scale);
+            v.push("setsar=1".to_string());
+        }
     }
     for e in &c.effects {
-        v.push(effect_filter(e));
+        let ef = effect_filter(e);
+        if !ef.is_empty() {
+            v.push(ef);
+        }
     }
 
     let off = c.anim_offset;
@@ -323,6 +355,21 @@ fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>,
     if !c.anim.scale.is_empty() {
         terms.push(format!("({})", kf_expr(&c.anim.scale, &format!("(t+{off:.4})"), 1.0)));
     }
+    // Zoom effect (first one wins): factor over the whole clip, optionally eased.
+    let zoom = c.effects.iter().find_map(|e| match e {
+        Effect::Zoom { from, to, fx, fy, ease } => Some((*from as f64, *to as f64, *fx as f64, *fy as f64, *ease)),
+        _ => None,
+    });
+    let zoom_expr = |var: &str| -> Option<String> {
+        let (from, to, _, _, ease) = zoom?;
+        let total = (c.duration + off).max(0.05);
+        let p = format!("min(1,max(0,({var})/{total:.4}))");
+        let p = if ease { format!("({p}*{p}*(3-2*{p}))") } else { format!("({p})") };
+        Some(format!("({from:.4}+({to:.4}-{from:.4})*{p})"))
+    };
+    if let Some(z) = zoom_expr(&format!("t+{off:.4}")) {
+        terms.push(z);
+    }
     if tin.kind == TransitionKind::Zoom {
         terms.push(format!("(0.6+0.4*{})", ramp("t", tin.duration)));
     }
@@ -345,6 +392,15 @@ fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>,
     }
     if !c.anim.pos_y.is_empty() {
         y = format!("{y}+H*({})", kf_expr(&c.anim.pos_y, &rel, 0.0));
+    }
+    if let (Some((_, _, fx, fy, _)), Some(z)) = (zoom, zoom_expr(&format!("t-{:.4}+{off:.4}", c.start))) {
+        // Keep the focus point of the picture fixed while it scales about its centre.
+        if (fx - 0.5).abs() > 1e-4 {
+            x = format!("{x}+(0.5-{fx:.4})*w*(1-1/{z})");
+        }
+        if (fy - 0.5).abs() > 1e-4 {
+            y = format!("{y}+(0.5-{fy:.4})*h*(1-1/{z})");
+        }
     }
     let p_in = |d: f64| ramp(&format!("t-{:.4}", c.start), d);
     let p_out = |d: f64| ramp(&format!("{:.4}-t", c.end()), d);
@@ -466,6 +522,25 @@ fn title_source(c: &Clip, spec: &TitleSpec, rw: u32, rh: u32, fps: u32) -> Strin
     parts.join(",")
 }
 
+/// `atempo` only accepts 0.5-2.0 per stage, so chain stages for other speeds (empty at 1x).
+fn atempo_chain(speed: f64) -> String {
+    let mut s = speed.clamp(0.1, 16.0);
+    if (s - 1.0).abs() < 1e-6 {
+        return String::new();
+    }
+    let mut out = String::new();
+    while s > 2.0 {
+        out.push_str("atempo=2.0,");
+        s /= 2.0;
+    }
+    while s < 0.5 {
+        out.push_str("atempo=0.5,");
+        s /= 0.5;
+    }
+    out.push_str(&format!("atempo={s:.6},"));
+    out
+}
+
 /// Build FFmpeg input arguments and the filter graph. Produces label [vout] when `video`
 /// and [aout] when `audio`. Returns (input args, filter graph, total duration).
 pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, audio: bool) -> (Vec<String>, String, f64) {
@@ -509,7 +584,7 @@ pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, a
 
         let Some(m) = project.media(c.media_id) else { continue };
         let wants_v = video && m.kind != MediaKind::Audio && !track.hidden;
-        let wants_a = audio && m.has_audio && m.kind != MediaKind::Image && !track.muted;
+        let wants_a = audio && m.has_audio && m.kind != MediaKind::Image && !track.muted && !c.freeze;
         if !wants_v && !wants_a {
             continue;
         }
@@ -519,8 +594,11 @@ pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, a
             MediaKind::Image => {
                 args.extend(["-loop".to_string(), "1".to_string(), "-framerate".to_string(), fps.to_string(), "-t".to_string(), f(c.duration), "-i".to_string(), path]);
             }
+            _ if c.freeze => {
+                args.extend(["-ss".to_string(), f(c.in_point), "-t".to_string(), "1".to_string(), "-i".to_string(), path]);
+            }
             _ => {
-                args.extend(["-ss".to_string(), f(c.in_point), "-t".to_string(), f(c.duration), "-i".to_string(), path]);
+                args.extend(["-ss".to_string(), f(c.in_point), "-t".to_string(), f(c.src_span()), "-i".to_string(), path]);
             }
         }
         let i = input_idx;
@@ -549,8 +627,13 @@ pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, a
             if c.audio_fade_out > 0.0 {
                 fades.push_str(&format!("afade=t=out:st={:.3}:d={:.3},", (c.duration - c.audio_fade_out).max(0.0), c.audio_fade_out));
             }
+            let mut retime = String::new();
+            if c.reverse {
+                retime.push_str("areverse,");
+            }
+            retime.push_str(&atempo_chain(c.speed));
             filters.push(format!(
-                "[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,volume={:.3},{fades}adelay={ms}|{ms}[a{i}]",
+                "[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,{retime}volume={:.3},{fades}adelay={ms}|{ms}[a{i}]",
                 c.volume
             ));
             audio_labels.push(format!("[a{i}]"));

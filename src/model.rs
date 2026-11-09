@@ -86,6 +86,8 @@ pub enum Effect {
     FlipH,
     FlipV,
     ChromaKey { color: [u8; 3], similarity: f32, blend: f32 },
+    /// Animated zoom from `from` to `to` (1.0 = normal) over the clip, centred on (fx, fy) in 0..1.
+    Zoom { from: f32, to: f32, fx: f32, fy: f32, ease: bool },
 }
 
 impl Effect {
@@ -101,6 +103,8 @@ impl Effect {
             Effect::FlipH,
             Effect::FlipV,
             Effect::ChromaKey { color: [0, 255, 0], similarity: 0.15, blend: 0.1 },
+            Effect::Zoom { from: 1.0, to: 1.5, fx: 0.5, fy: 0.5, ease: true },
+            Effect::Zoom { from: 1.5, to: 1.0, fx: 0.5, fy: 0.5, ease: true },
         ]
     }
     pub fn label(&self) -> &'static str {
@@ -115,6 +119,13 @@ impl Effect {
             Effect::FlipH => "Flip horizontal",
             Effect::FlipV => "Flip vertical",
             Effect::ChromaKey { .. } => "Remove a color (chroma key)",
+            Effect::Zoom { from, to, .. } => {
+                if from <= to {
+                    "Zoom in"
+                } else {
+                    "Zoom out"
+                }
+            }
         }
     }
 }
@@ -326,6 +337,10 @@ impl Default for TitleSpec {
     }
 }
 
+fn one() -> f64 {
+    1.0
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: u64,
@@ -353,6 +368,15 @@ pub struct Clip {
     /// Generated text clip. `media_id` is 0 for these.
     #[serde(default)]
     pub title: Option<TitleSpec>,
+    /// Playback speed (1.0 = normal). The clip covers `duration * speed` seconds of source.
+    #[serde(default = "one")]
+    pub speed: f64,
+    /// Play the source backwards.
+    #[serde(default)]
+    pub reverse: bool,
+    /// Freeze frame: holds the single source frame at `in_point` for `duration`.
+    #[serde(default)]
+    pub freeze: bool,
     /// Runtime only: seconds already elapsed when a playback window starts inside this clip.
     #[serde(skip)]
     pub anim_offset: f64,
@@ -361,6 +385,22 @@ pub struct Clip {
 impl Clip {
     pub fn end(&self) -> f64 {
         self.start + self.duration
+    }
+
+    /// Source-time seconds consumed by the clip.
+    pub fn src_span(&self) -> f64 {
+        self.duration * self.speed
+    }
+
+    /// Source time shown at `x` seconds into the clip.
+    pub fn src_time_at(&self, x: f64) -> f64 {
+        if self.freeze {
+            self.in_point
+        } else if self.reverse {
+            self.in_point + (self.duration - x).max(0.0) * self.speed
+        } else {
+            self.in_point + x * self.speed
+        }
     }
 
     pub fn new(id: u64, media_id: u64, track: usize, start: f64, in_point: f64, duration: f64) -> Self {
@@ -379,6 +419,9 @@ impl Clip {
             effects: vec![],
             anim: Anim::default(),
             title: None,
+            speed: 1.0,
+            reverse: false,
+            freeze: false,
             anim_offset: 0.0,
         }
     }
@@ -551,7 +594,7 @@ impl Project {
         if t <= c.start + 0.05 || t >= c.end() - 0.05 {
             return None;
         }
-        let is_image = self.media(c.media_id).map_or(false, |m| m.kind == MediaKind::Image);
+        let is_image = c.freeze || self.media(c.media_id).map_or(false, |m| m.kind == MediaKind::Image);
         let first = t - c.start;
         let new_id = self.alloc_id();
         let (anim_l, anim_r) = c.anim.split_at(first);
@@ -561,8 +604,24 @@ impl Project {
             left.anim = anim_l;
             left.transition_out = Transition::default();
             left.audio_fade_out = 0.0;
+            if c.reverse && !is_image {
+                // Reversed: the left part is the *later* part of the source.
+                left.in_point = c.in_point + (c.duration - first) * c.speed;
+            }
         }
-        let mut right = Clip::new(new_id, c.media_id, c.track, t, if is_image { 0.0 } else { c.in_point + first }, c.duration - first);
+        let right_in = if c.freeze {
+            c.in_point
+        } else if is_image {
+            0.0
+        } else if c.reverse {
+            c.in_point
+        } else {
+            c.in_point + first * c.speed
+        };
+        let mut right = Clip::new(new_id, c.media_id, c.track, t, right_in, c.duration - first);
+        right.speed = c.speed;
+        right.reverse = c.reverse;
+        right.freeze = c.freeze;
         right.volume = c.volume;
         right.effects = c.effects.clone();
         right.title = c.title.clone();
@@ -571,6 +630,89 @@ impl Project {
         right.audio_fade_out = c.audio_fade_out;
         self.clips.push(right);
         Some(new_id)
+    }
+
+    /// Move every clip on `track` that starts at or after `from` by `delta` seconds (never below 0).
+    pub fn shift_after(&mut self, track: usize, from: f64, delta: f64, ignore: Option<u64>) {
+        for c in self.clips.iter_mut() {
+            if c.track == track && Some(c.id) != ignore && c.start >= from - EPS {
+                c.start = (c.start + delta).max(0.0);
+            }
+        }
+    }
+
+    /// Insert a freeze frame of the clip's picture at timeline time `t`, lasting `dur` seconds.
+    /// The clip is split at `t`, later clips on the same track move right, and the frozen frame
+    /// is placed in the gap. Returns the id of the freeze clip.
+    pub fn insert_freeze(&mut self, clip_id: u64, t: f64, dur: f64) -> Option<u64> {
+        let c = self.clip(clip_id)?.clone();
+        if c.title.is_some() || c.freeze || dur <= 0.0 {
+            return None;
+        }
+        let kind = self.media(c.media_id)?.kind;
+        if kind != MediaKind::Video && kind != MediaKind::Image {
+            return None;
+        }
+        if t < c.start - EPS || t > c.end() + EPS {
+            return None;
+        }
+        let x = (t - c.start).clamp(0.0, c.duration);
+        let src = c.src_time_at(x);
+        // Snap to a cut when at an edge, otherwise split.
+        let at_start = x <= 0.05;
+        let at_end = x >= c.duration - 0.05;
+        let freeze_start = if at_start {
+            c.start
+        } else if at_end {
+            c.end()
+        } else {
+            t
+        };
+        let shift_from = if at_start { c.start } else { freeze_start };
+        // Ripple first (before the split creates a new clip that must also move).
+        self.shift_after(c.track, shift_from, dur, if at_start { None } else { Some(clip_id) });
+        if !at_start && !at_end {
+            let right = self.split(clip_id, t)?;
+            if let Some(r) = self.clip_mut(right) {
+                r.start += dur;
+            }
+        }
+        let id = self.alloc_id();
+        let mut f = Clip::new(id, c.media_id, c.track, freeze_start, src, dur);
+        f.freeze = true;
+        f.volume = 0.0;
+        self.clips.push(f);
+        Some(id)
+    }
+
+    /// Change playback speed of the part of a clip between timeline times `t0` and `t1`.
+    /// Splits the clip as needed and ripples later clips on the track. Returns the middle clip id.
+    pub fn apply_speed_range(&mut self, clip_id: u64, t0: f64, t1: f64, speed: f64) -> Option<u64> {
+        let c = self.clip(clip_id)?.clone();
+        if c.title.is_some() || c.freeze || self.media(c.media_id).map_or(true, |m| m.kind == MediaKind::Image) {
+            return None;
+        }
+        let speed = speed.clamp(0.1, 16.0);
+        let (a, b) = (t0.min(t1).max(c.start), t0.max(t1).min(c.end()));
+        if b - a < 0.05 {
+            return None;
+        }
+        let mut mid = clip_id;
+        if b < c.end() - 0.05 {
+            self.split(clip_id, b)?;
+        }
+        if a > c.start + 0.05 {
+            mid = self.split(clip_id, a)?;
+        }
+        let m = self.clip_mut(mid)?;
+        let old_d = m.duration;
+        let new_d = old_d * m.speed / speed;
+        m.speed = speed;
+        m.duration = new_d;
+        let delta = new_d - old_d;
+        let bound = a + old_d;
+        self.shift_after(c.track, bound, delta, Some(mid));
+        Some(mid)
     }
 
     pub fn remove_clip(&mut self, id: u64) {
@@ -592,10 +734,18 @@ impl Project {
             .filter(|c| c.end() > t0 + EPS)
             .map(|c| {
                 let cut = (t0 - c.start).max(0.0);
-                let is_image = self.media(c.media_id).map_or(false, |m| m.kind == MediaKind::Image);
+                let is_image = c.freeze || self.media(c.media_id).map_or(false, |m| m.kind == MediaKind::Image);
                 let mut n = c.clone();
                 n.start = (c.start - t0).max(0.0);
-                n.in_point = if is_image { 0.0 } else { c.in_point + cut };
+                n.in_point = if c.freeze {
+                    c.in_point
+                } else if is_image {
+                    0.0
+                } else if c.reverse {
+                    c.in_point
+                } else {
+                    c.in_point + cut * c.speed
+                };
                 n.duration = c.duration - cut;
                 n.anim_offset = cut;
                 n

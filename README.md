@@ -38,8 +38,16 @@ The finished program is `target\release\reelforge.exe`.
 
 ### Transitions, effects and animation
 - **Transitions** (per clip, in and out): fade, slide left/right/up/down, zoom. Shown as ramps on the clip.
-- **Effects** (stackable per clip): colour adjustment, blur, sharpen, grayscale, sepia, invert, vignette, flip H/V, chroma key (green screen).
+- **Effects** (stackable per clip): colour adjustment, blur, sharpen, grayscale, sepia, invert, vignette, flip H/V, chroma key (green screen), **zoom in / zoom out**.
 - **Keyframes:** opacity, scale, position X/Y. Move the playhead over a clip, click `+ Keyframe at playhead`, set the value. Keyframes show as diamonds on the clip and blend linearly.
+
+### Freeze frame, speed and reverse, zoom
+- **Freeze frame** (Edit menu, **F**, or the *Freeze frame* section in Properties): park the playhead on a video clip and set how long to hold. The clip is split at the playhead and that single picture is held for the chosen time, so the video looks paused. Later clips on the same track move right to make room. The hold is silent and shows in teal on the timeline. Drag its edges or set its Duration to change the length.
+- **Speed and direction** (*Speed & direction* in Properties, video and audio clips):
+  - **Speed** slider 0.1x to 16x (plus 0.25x / 0.5x / 1x / 2x / 4x buttons) for the whole clip. The clip gets shorter or longer on the timeline and later clips on the track move with it. Audio is retimed along with the picture (pitch is preserved).
+  - **Reverse** plays the clip backwards, audio included.
+  - **Change speed between two points:** set From and To (type a time or press *Playhead*), pick a speed and press *Apply to range*. The clip is split at both points and only the part in between changes speed, so you can slow down one moment or speed through a boring stretch. Trimming, splitting and snapping all understand speed and reverse. Timeline labels show `2x`, `0.5x` and `(rev)`.
+- **Zoom** (*Effects > + Add effect > Zoom in / Zoom out*): zooms smoothly across the whole clip. Set the Start and End zoom (0.25x to 4x), the Focus X / Y point that stays fixed on screen (0.5 / 0.5 is the centre), and whether the start and end are eased. To zoom in during only part of a video, split the clip first and add Zoom to the piece you want.
 
 ### Preview
 - Real-time playback with audio (Space).
@@ -66,6 +74,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 |---|---|
 | Space | Play / pause |
 | S | Split at playhead |
+| F | Freeze frame at playhead |
 | Del | Delete selected clip |
 | Left / Right | Step one frame |
 | Home / End | Jump to start / end |
@@ -83,7 +92,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 
 <img width="359" height="444" alt="RF5" src="https://github.com/user-attachments/assets/274e9e59-f387-49c3-8f2f-402ad50d3832" />
 
-## Known limitations (v0.4)
+## Known limitations (v0.5)
 
 - **This code has not been compiled or run on Windows by its author.** The FFmpeg commands it generates (export, preview, titles, recordings) were tested against FFmpeg 6.1 on Linux with synthetic inputs; the egui interface and the Windows capture devices (`gdigrab`, DirectShow) have not. Expect to fix a few compile errors on the first build.
 - Screen and voice recording use FFmpeg's `gdigrab` and DirectShow, so they work on Windows only. System-audio capture needs a loopback device such as "Stereo Mix", which many PCs have disabled by default.
@@ -91,6 +100,8 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 - Preview playback streams from FFmpeg with mixed audio through `rodio`. Audio and video start together but are not sample-locked, so expect small drift on long playbacks. Full HD preview can drop frames on slower machines.
 - Editing, seeking or stepping while playing stops playback.
 - The unsaved-changes prompt covers closing the program only. File > New and File > Open replace the current project without asking. Undoing back to the saved state still counts as changed.
+- **Speed / reverse / freeze:** changing a clip's length ripples later clips on the *same track only*. Audio on another track is not moved, so a sped-up video with separate voice-over can drift out of sync; keep them on one track or retime both. Reverse buffers every frame of the clip in memory, so use it on short clips (a few seconds to a minute, less at 4K), and the paused preview of a long reversed clip can be slow. Freeze frames are silent. Images and titles cannot be sped up (their length is set directly).
+- **Zoom** uses the first Zoom effect on a clip. Zooming in past 1x crops the picture; zooming out below 1x or moving the focus to an edge can reveal black background. The zoom is applied after other effects, and combines (multiplies) with scale keyframes.
 - Keyframe times are relative to the clip start. Trimming a clip's left edge does not shift them. Splitting a clip keeps animation continuous.
 - Starting playback in the middle of a fade/zoom-in skips that transition's ramp for that session.
 - Title fonts are loaded from `C:\Windows\Fonts`. Titles are written to temp files, so a user name containing an apostrophe in the temp path can break title rendering.
