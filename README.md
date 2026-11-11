@@ -21,7 +21,7 @@ The finished program is in the following folder: `target\release\reelforge.exe`.
 
 ### Editing
 - **Import:** file dialog, multi-select, or drag files onto the window. Video, audio and images.
-- **Timeline:** multiple tracks (higher track = on top), drag clips from the bin, move, trim edges, split, delete, snapping, mute/hide per track, zoom (Ctrl+wheel), scroll (Shift+wheel).
+- **Timeline:** multiple tracks (higher track = on top), drag clips from the bin, move, trim edges, split, delete, snapping, mute/hide per track, zoom (Ctrl+wheel or the Zoom slider), and a **horizontal scrollbar** above the tracks: drag the thumb or click the bar to jump anywhere on the timeline (a red tick shows the playhead). Shift+wheel also scrolls.
 - **Track collision rules:**
   - Clips on the **same track never overlap**. Dragging a clip onto another slides it to the nearest free spot, trimming stops at the neighbouring clip, and dropping from the media bin lands in the nearest gap.
   - Clips on **different tracks can overlap freely**. They are layered (upper track on top) and their audio is mixed.

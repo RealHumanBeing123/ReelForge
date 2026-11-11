@@ -1251,9 +1251,52 @@ impl ReelForge {
                 });
             });
             ui.separator();
+            self.h_scrollbar(ui);
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.timeline_body(ui));
         });
+    }
+
+    /// Horizontal scrollbar for the timeline, aligned with the track lanes. Drag the thumb, or
+    /// click the bar to jump there. The scrollable length is the project plus some room to spare.
+    fn h_scrollbar(&mut self, ui: &mut egui::Ui) {
+        let width = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 14.0), Sense::hover());
+        let bar = Rect::from_min_max(Pos2::new(rect.left() + HEADER_W + 2.0, rect.top() + 2.0), Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0));
+        if bar.width() < 20.0 {
+            return;
+        }
+        let pps = self.pps as f64;
+        let view = bar.width() as f64 / pps;
+        let total = (self.project.duration() * 1.1 + view * 0.5).max(self.playhead + 5.0).max(self.scroll + view).max(view);
+        let max_scroll = (total - view).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        let track_w = bar.width() as f64;
+        let thumb_w = ((view / total) * track_w).clamp(24.0, track_w);
+        let travel = (track_w - thumb_w).max(1.0);
+        let thumb_x = bar.left() as f64 + if max_scroll > 0.0 { self.scroll / max_scroll * travel } else { 0.0 };
+        let thumb = Rect::from_min_size(Pos2::new(thumb_x as f32, bar.top()), Vec2::new(thumb_w as f32, bar.height()));
+
+        let track_resp = ui.interact(bar, egui::Id::new("hscroll_track"), Sense::click());
+        let thumb_resp = ui.interact(thumb, egui::Id::new("hscroll_thumb"), Sense::drag());
+        if thumb_resp.dragged() {
+            self.scroll = (self.scroll + thumb_resp.drag_delta().x as f64 / travel * max_scroll).clamp(0.0, max_scroll);
+        } else if track_resp.clicked() {
+            if let Some(p) = track_resp.interact_pointer_pos() {
+                let centre = (p.x as f64 - bar.left() as f64 - thumb_w / 2.0) / travel;
+                self.scroll = (centre * max_scroll).clamp(0.0, max_scroll);
+            }
+        }
+        if thumb_resp.hovered() || thumb_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        let p = ui.painter();
+        p.rect_filled(bar, 4.0, Color32::from_gray(22));
+        let col = if thumb_resp.dragged() { Color32::from_gray(150) } else if thumb_resp.hovered() { Color32::from_gray(120) } else { Color32::from_gray(90) };
+        p.rect_filled(thumb.shrink2(Vec2::new(0.0, 1.0)), 4.0, col);
+        // playhead position marker
+        let px = bar.left() as f64 + (self.playhead / total) * track_w;
+        p.line_segment([Pos2::new(px as f32, bar.top()), Pos2::new(px as f32, bar.bottom())], Stroke::new(1.5, Color32::from_rgb(255, 90, 80)));
     }
 
     fn timeline_body(&mut self, ui: &mut egui::Ui) {
