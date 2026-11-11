@@ -9,7 +9,7 @@ A lightweight timeline video editor for Windows, written in Rust. Layout is as f
 3. ```cargo build --release```
 4. Download an FFmpeg **full** build for Windows (version **7.1 or newer**, e.g. gyan.dev "full" or BtbN GPL build) and copy `ffmpeg.exe` and `ffprobe.exe` next to `target\release\reelforge.exe` (or put them on `PATH`).
 
-The finished program is `target\release\reelforge.exe`.
+The finished program is in the following folder: `target\release\reelforge.exe`.
 
 ## How it works
 
