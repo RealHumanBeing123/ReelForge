@@ -230,6 +230,8 @@ pub struct Config {
     pub macros: Vec<Macro>,
     #[serde(default)]
     pub fx_presets: Vec<FxPreset>,
+    #[serde(default)]
+    pub export_presets: Vec<crate::render::ExportPreset>,
     #[serde(default = "yes")]
     pub show_media: bool,
     #[serde(default = "yes")]
@@ -242,7 +244,7 @@ fn yes() -> bool {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], show_media: true, show_props: true }
+        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], export_presets: vec![], show_media: true, show_props: true }
     }
 }
 

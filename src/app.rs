@@ -100,6 +100,10 @@ pub struct ReelForge {
     last_req_time: f64,
     edit_stamp: Option<(u64, Instant)>,
     ext: ext::Ext,
+    batch: std::collections::VecDeque<RenderSettings>,
+    batch_total: usize,
+    batch_dir: Option<PathBuf>,
+    batch_sel: std::collections::HashSet<String>,
     playback_rate: f64,
     freeze_len: f64,
     range_from: f64,
@@ -185,6 +189,10 @@ impl ReelForge {
             last_req_time: -1.0,
             edit_stamp: None,
             ext: ext::Ext::load(),
+            batch: Default::default(),
+            batch_total: 0,
+            batch_dir: None,
+            batch_sel: Default::default(),
             playback_rate: 1.0,
             freeze_len: 2.0,
             range_from: 0.0,
@@ -548,7 +556,55 @@ impl ReelForge {
             }
             if finished {
                 self.render_rx = None;
+                // batch export: carry on with the next item only after a clean finish
+                if self.render_msg.starts_with("Export finished") {
+                    if let Some(next) = self.batch.pop_front() {
+                        self.render_progress = 0.0;
+                        self.begin_render(ctx, next);
+                    } else if self.batch_total > 0 {
+                        self.render_msg = format!("Batch finished: {} file(s) exported.", self.batch_total);
+                        self.status = self.render_msg.clone();
+                        self.batch_total = 0;
+                    }
+                } else {
+                    if self.batch_total > 0 {
+                        self.render_msg = format!("{}\n(Batch stopped; {} item(s) not exported.)", self.render_msg, self.batch.len());
+                    }
+                    self.batch.clear();
+                    self.batch_total = 0;
+                }
             }
+        }
+    }
+
+    /// Start rendering with `settings` (honouring the in-out range option).
+    fn begin_render(&mut self, ctx: &egui::Context, mut settings: RenderSettings) {
+        settings.normalize();
+        let to_render = match (self.project.mark_in, self.project.mark_out) {
+            (Some(a), Some(b)) if settings.use_range && (b - a).abs() > 0.05 => self.project.range(a.min(b), a.max(b)),
+            _ => self.project.clone(),
+        };
+        let (rx, c) = render::start(ctx.clone(), to_render, settings);
+        self.render_rx = Some(rx);
+        self.render_cancel = c;
+    }
+
+    /// Queue one export per selected preset, written into `dir`.
+    fn start_batch(&mut self, ctx: &egui::Context, dir: PathBuf, presets: Vec<render::ExportPreset>) {
+        let stem = self.project_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "export".to_string());
+        self.batch.clear();
+        for p in presets {
+            let mut st = self.settings.clone();
+            p.apply(&mut st);
+            let safe: String = p.name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+            st.output = Some(dir.join(format!("{stem}_{}.{}", safe.trim_matches('_'), st.container.ext())));
+            self.batch.push_back(st);
+        }
+        self.batch_total = self.batch.len();
+        if let Some(first) = self.batch.pop_front() {
+            self.render_progress = 0.0;
+            self.render_msg.clear();
+            self.begin_render(ctx, first);
         }
     }
 
@@ -1994,6 +2050,7 @@ impl ReelForge {
         let mut open = true;
         let mut start = false;
         let mut cancel = false;
+        let mut batch_go: Option<Vec<render::ExportPreset>> = None;
         let rendering = self.render_rx.is_some();
         let (ow, oh) = self.project.output_size(self.settings.short_side);
         let dur = self.project.duration();
@@ -2003,6 +2060,61 @@ impl ReelForge {
                 settings_grid(ui, &mut self.settings, GridMode::Export, (ow, oh), dur);
                 ui.add_space(6.0);
                 ui.separator();
+                ui.label(egui::RichText::new("Presets").strong());
+                let mut presets = render::ExportPreset::builtin();
+                let n_builtin = presets.len();
+                presets.extend(self.ext.cfg.export_presets.iter().cloned());
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("exp_preset").selected_text("Apply a preset...").show_ui(ui, |ui| {
+                        for p in &presets {
+                            if ui.selectable_label(false, &p.name).clicked() {
+                                p.apply(&mut self.settings);
+                            }
+                        }
+                    });
+                    ui.add(egui::TextEdit::singleline(&mut self.ext.preset_name).hint_text("name").desired_width(110.0));
+                    if ui.add_enabled(!self.ext.preset_name.trim().is_empty(), egui::Button::new("Save as preset")).clicked() {
+                        let np = render::ExportPreset::from_settings(self.ext.preset_name.trim(), &self.settings);
+                        self.ext.cfg.export_presets.retain(|p| p.name != np.name);
+                        self.ext.cfg.export_presets.push(np);
+                        self.ext.save_cfg();
+                    }
+                });
+                egui::CollapsingHeader::new("Batch export (several presets at once)").id_salt("batch").show(ui, |ui| {
+                    for (i, p) in presets.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let mut on = self.batch_sel.contains(&p.name);
+                            if ui.checkbox(&mut on, &p.name).changed() {
+                                if on {
+                                    self.batch_sel.insert(p.name.clone());
+                                } else {
+                                    self.batch_sel.remove(&p.name);
+                                }
+                            }
+                            if i >= n_builtin && ui.small_button("Delete").clicked() {
+                                let name = p.name.clone();
+                                self.ext.cfg.export_presets.retain(|x| x.name != name);
+                                self.batch_sel.remove(&name);
+                                self.ext.save_cfg();
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(self.batch_dir.as_ref().map(|d| elide(&d.to_string_lossy(), 30)).unwrap_or_else(|| "(no folder)".into()));
+                        if ui.button("Folder...").clicked() {
+                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                self.batch_dir = Some(d);
+                            }
+                        }
+                    });
+                    let chosen: Vec<render::ExportPreset> = presets.iter().filter(|p| self.batch_sel.contains(&p.name)).cloned().collect();
+                    let ok = !chosen.is_empty() && self.batch_dir.is_some() && dur > 0.0 && self.ffmpeg_ok;
+                    if ui.add_enabled(ok, egui::Button::new(format!("Export {} file(s)", chosen.len()))).clicked() {
+                        batch_go = Some(chosen);
+                    }
+                    ui.label(egui::RichText::new("Files are named after the project and preset. Uses the subtitle and range options below. Presets set the size, codec, bitrate and loudness.").weak().small());
+                });
+                ui.add_space(4.0);
                 ui.label(egui::RichText::new("Audio, subtitles and range").strong());
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.settings.loudnorm, "Normalize loudness to");
@@ -2020,6 +2132,9 @@ impl ReelForge {
 
             ui.add_space(10.0);
             if rendering {
+                if self.batch_total > 0 {
+                    ui.label(format!("Batch: file {} of {}", self.batch_total - self.batch.len(), self.batch_total));
+                }
                 ui.add(egui::ProgressBar::new(self.render_progress).show_percentage().animate(true));
                 if ui.button("Cancel export").clicked() {
                     cancel = true;
@@ -2049,19 +2164,18 @@ impl ReelForge {
         });
 
         if cancel {
+            self.batch.clear();
             self.render_cancel.store(true, Ordering::Relaxed);
         }
+        if let (Some(list), Some(dir)) = (batch_go, self.batch_dir.clone()) {
+            self.start_batch(ctx, dir, list);
+        }
         if start {
-            self.settings.normalize();
             self.render_progress = 0.0;
             self.render_msg.clear();
-            let to_render = match (self.project.mark_in, self.project.mark_out) {
-                (Some(a), Some(b)) if self.settings.use_range && (b - a).abs() > 0.05 => self.project.range(a.min(b), a.max(b)),
-                _ => self.project.clone(),
-            };
-            let (rx, c) = render::start(ctx.clone(), to_render, self.settings.clone());
-            self.render_rx = Some(rx);
-            self.render_cancel = c;
+            self.batch_total = 0;
+            let st = self.settings.clone();
+            self.begin_render(ctx, st);
         }
         if !open && !rendering {
             self.export_open = false;

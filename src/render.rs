@@ -2,6 +2,7 @@ use crate::interchange;
 use crate::model::{AudioFx, BlendMode, Clip, Effect, Keyframe, MediaKind, Project, TitlePos, TitleSpec, Transition, TransitionKind};
 use crate::util::command;
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum Container {
     Mp4,
     Mkv,
@@ -55,7 +56,7 @@ impl Container {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum VideoCodec {
     H264,
     H265,
@@ -70,7 +71,7 @@ pub enum VideoCodec {
     HevcQsv,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum Speed {
     Fast,
     Balanced,
@@ -122,7 +123,7 @@ impl VideoCodec {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum AudioCodec {
     Aac,
     Mp3,
@@ -149,7 +150,7 @@ impl AudioCodec {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum RateControl {
     Bitrate,
     Crf,
@@ -232,6 +233,94 @@ impl RenderSettings {
         if !self.vcodec.supports_crf() {
             self.rate_control = RateControl::Bitrate;
         }
+    }
+}
+
+/// A named set of export options (everything except the output file).
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct ExportPreset {
+    pub name: String,
+    pub container: Container,
+    pub short_side: u32,
+    pub fps: u32,
+    pub vcodec: VideoCodec,
+    pub rate_control: RateControl,
+    pub video_kbps: u32,
+    pub crf: u32,
+    pub acodec: AudioCodec,
+    pub audio_kbps: u32,
+    pub speed: Speed,
+    pub loudnorm: bool,
+    pub lufs: f32,
+}
+
+impl ExportPreset {
+    pub fn from_settings(name: &str, s: &RenderSettings) -> ExportPreset {
+        ExportPreset {
+            name: name.to_string(),
+            container: s.container,
+            short_side: s.short_side,
+            fps: s.fps,
+            vcodec: s.vcodec,
+            rate_control: s.rate_control,
+            video_kbps: s.video_kbps,
+            crf: s.crf,
+            acodec: s.acodec,
+            audio_kbps: s.audio_kbps,
+            speed: s.speed,
+            loudnorm: s.loudnorm,
+            lufs: s.lufs,
+        }
+    }
+
+    /// Copy these options into `s`, leaving the output file, subtitles and range options alone.
+    pub fn apply(&self, s: &mut RenderSettings) {
+        s.container = self.container;
+        s.short_side = self.short_side;
+        s.fps = self.fps;
+        s.vcodec = self.vcodec;
+        s.rate_control = self.rate_control;
+        s.video_kbps = self.video_kbps;
+        s.crf = self.crf;
+        s.acodec = self.acodec;
+        s.audio_kbps = self.audio_kbps;
+        s.speed = self.speed;
+        s.loudnorm = self.loudnorm;
+        s.lufs = self.lufs;
+        s.normalize();
+    }
+
+    /// Ready-made presets for common destinations.
+    pub fn builtin() -> Vec<ExportPreset> {
+        let p = |name: &str, container, short_side, fps, vcodec, video_kbps, acodec, audio_kbps, lufs: Option<f32>| ExportPreset {
+            name: name.to_string(),
+            container,
+            short_side,
+            fps,
+            vcodec,
+            rate_control: RateControl::Bitrate,
+            video_kbps,
+            crf: 20,
+            acodec,
+            audio_kbps,
+            speed: Speed::Balanced,
+            loudnorm: lufs.is_some(),
+            lufs: lufs.unwrap_or(-14.0),
+        };
+        use AudioCodec as A;
+        use Container as C;
+        use VideoCodec as V;
+        vec![
+            p("YouTube 1080p", C::Mp4, 1080, 30, V::H264, 12_000, A::Aac, 192, Some(-14.0)),
+            p("YouTube 4K", C::Mp4, 2160, 30, V::H265, 35_000, A::Aac, 256, Some(-14.0)),
+            p("Instagram / TikTok (set canvas 9:16)", C::Mp4, 1080, 30, V::H264, 8_000, A::Aac, 192, Some(-14.0)),
+            p("X / Twitter 720p", C::Mp4, 720, 30, V::H264, 5_000, A::Aac, 128, Some(-14.0)),
+            p("Vimeo 1080p", C::Mp4, 1080, 30, V::H264, 20_000, A::Aac, 256, None),
+            p("Small file (email / Discord)", C::Mp4, 720, 30, V::H264, 1_800, A::Aac, 96, None),
+            p("Web (WebM VP9)", C::WebM, 1080, 30, V::Vp9, 5_000, A::Opus, 128, Some(-14.0)),
+            p("Broadcast 1080p25 (-23 LUFS)", C::Mov, 1080, 25, V::H264, 25_000, A::Pcm, 1536, Some(-23.0)),
+            p("Archive (ProRes)", C::Mov, 1080, 30, V::ProRes, 0, A::Pcm, 1536, None),
+        ]
     }
 }
 
