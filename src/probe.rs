@@ -67,5 +67,8 @@ pub fn probe(path: &Path) -> Result<MediaItem> {
         has_audio: audio.is_some(),
         video_codec: video.and_then(|s| s["codec_name"].as_str()).unwrap_or("").to_string(),
         audio_codec: audio.and_then(|s| s["codec_name"].as_str()).unwrap_or("").to_string(),
+        tag: String::new(),
+        bin: String::new(),
+        proxy: None,
     })
 }

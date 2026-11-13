@@ -1,4 +1,5 @@
-use crate::model::{Clip, Effect, Keyframe, MediaKind, Project, TitlePos, TitleSpec, Transition, TransitionKind};
+use crate::interchange;
+use crate::model::{AudioFx, BlendMode, Clip, Effect, Keyframe, MediaKind, Project, TitlePos, TitleSpec, Transition, TransitionKind};
 use crate::util::command;
 use eframe::egui;
 use std::io::{BufRead, BufReader, Read};
@@ -185,6 +186,15 @@ pub struct RenderSettings {
     pub acodec: AudioCodec,
     pub audio_kbps: u32,
     pub speed: Speed,
+    /// Normalise the final mix to `lufs` (loudnorm).
+    pub loudnorm: bool,
+    pub lufs: f32,
+    /// Burn the project's subtitles into the picture.
+    pub burn_subs: bool,
+    /// Also write an .srt file next to the export.
+    pub sidecar_srt: bool,
+    /// Export only between the in and out points (when both are set).
+    pub use_range: bool,
 }
 
 impl Default for RenderSettings {
@@ -201,6 +211,11 @@ impl Default for RenderSettings {
             acodec: AudioCodec::Aac,
             audio_kbps: 192,
             speed: Speed::Balanced,
+            loudnorm: false,
+            lufs: -14.0,
+            burn_subs: true,
+            sidecar_srt: false,
+            use_range: true,
         }
     }
 }
@@ -244,14 +259,8 @@ fn kf_expr(kfs: &[Keyframe], var: &str, default: f64) -> String {
             let mut e = format!("{:.4}", kfs[kfs.len() - 1].v);
             for w in kfs.windows(2).rev() {
                 let span = (w[1].t - w[0].t).max(1e-6);
-                e = format!(
-                    "if(lt({var},{:.4}),{:.4}+({:.4})*({var}-{:.4})/{:.4},{e})",
-                    w[1].t,
-                    w[0].v,
-                    w[1].v - w[0].v,
-                    w[0].t,
-                    span
-                );
+                let p = format!("(({var}-{:.4})/{:.4})", w[0].t, span);
+                e = format!("if(lt({var},{:.4}),{:.4}+({:.4})*{},{e})", w[1].t, w[0].v, w[1].v - w[0].v, w[0].ease.expr(&p));
             }
             format!("if(lt({var},{:.4}),{:.4},{e})", kfs[0].t, kfs[0].v)
         }
@@ -266,7 +275,7 @@ fn hex(c: [u8; 3]) -> String {
     format!("0x{:02X}{:02X}{:02X}", c[0], c[1], c[2])
 }
 
-fn effect_filter(e: &Effect) -> String {
+fn effect_filter(e: &Effect, uid: &str) -> String {
     match e {
         Effect::ColorAdjust { brightness, contrast, saturation } => {
             format!("eq=brightness={brightness:.3}:contrast={contrast:.3}:saturation={saturation:.3}")
@@ -284,6 +293,67 @@ fn effect_filter(e: &Effect) -> String {
         }
         // Zoom is applied through the layer's dynamic scale and overlay position, not a filter.
         Effect::Zoom { .. } => String::new(),
+        Effect::ColorWheels { lift, gamma, gain } => {
+            if lift.iter().chain(gamma).chain(gain).all(|v| v.abs() < 1e-4) {
+                return String::new();
+            }
+            format!(
+                "colorbalance=rs={:.3}:gs={:.3}:bs={:.3}:rm={:.3}:gm={:.3}:bm={:.3}:rh={:.3}:gh={:.3}:bh={:.3}",
+                lift[0], lift[1], lift[2], gamma[0], gamma[1], gamma[2], gain[0], gain[1], gain[2]
+            )
+        }
+        Effect::Temperature { kelvin, tint } => {
+            let mut parts: Vec<String> = vec![];
+            if (kelvin - 6500.0).abs() > 1.0 {
+                parts.push(format!("colortemperature=temperature={:.0}", kelvin.clamp(1000.0, 40000.0)));
+            }
+            if tint.abs() > 1e-3 {
+                parts.push(format!("colorbalance=gm={:.3}", (-tint * 0.4).clamp(-1.0, 1.0)));
+            }
+            parts.join(",")
+        }
+        Effect::Lut { path } => {
+            if path.is_empty() {
+                String::new()
+            } else {
+                format!("lut3d=file='{}'", esc_path(std::path::Path::new(path)))
+            }
+        }
+        Effect::HslAdjust { band, hue, sat, intensity } => {
+            format!("huesaturation=hue={hue:.2}:saturation={sat:.3}:intensity={intensity:.3}:colors={}", band.ff())
+        }
+        Effect::Curves { preset } => format!("curves=preset={}", preset.ff()),
+        Effect::Glow { radius, strength } => {
+            format!(
+                "split[gla{uid}][glb{uid}];[gla{uid}]gblur=sigma={:.1}[glc{uid}];[glb{uid}][glc{uid}]blend=all_mode=screen:all_opacity={:.3}",
+                radius.max(1.0),
+                strength.clamp(0.0, 1.0)
+            )
+        }
+        Effect::Distort { amount } => format!("lenscorrection=k1={a:.3}:k2={a:.3}", a = amount.clamp(-0.9, 0.9)),
+        Effect::Rotate { degrees } => format!("format=yuva420p,rotate=a={:.5}:ow=iw:oh=ih:c=black@0", degrees.to_radians()),
+        Effect::Pixelate { block } => {
+            let b = (block.round() as i32).clamp(2, 256);
+            format!("pixelize=w={b}:h={b}")
+        }
+        Effect::Grain { amount } => format!("noise=alls={}:allf=t+u", (amount.round() as i32).clamp(1, 100)),
+        Effect::Denoise { strength } => format!("hqdn3d={:.1}", strength.clamp(0.5, 20.0)),
+        Effect::Stabilize { strength } => {
+            let r = (strength.round() as i32).clamp(1, 64);
+            format!("deshake=rx={r}:ry={r}:edge=mirror")
+        }
+        Effect::Mask { ellipse, cx, cy, w, h, feather, invert } => {
+            let (rx, ry) = ((w / 2.0).max(0.01), (h / 2.0).max(0.01));
+            let d = if *ellipse {
+                format!("hypot((X/W-{cx:.4})/{rx:.4},(Y/H-{cy:.4})/{ry:.4})")
+            } else {
+                format!("max(abs(X/W-{cx:.4})/{rx:.4},abs(Y/H-{cy:.4})/{ry:.4})")
+            };
+            let f = (feather * 2.0).max(0.002);
+            let inside = format!("min(1,max(0,(1-{d})/{f:.4}))");
+            let m = if *invert { format!("(1-{inside})") } else { inside };
+            format!("format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='alpha(X,Y)*{m}'")
+        }
     }
 }
 
@@ -313,6 +383,9 @@ fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>,
             v.push("reverse".to_string());
         }
         v.push(format!("setpts=PTS/{:.6}", c.speed.max(0.01)));
+        if c.interpolate && c.speed < 0.999 {
+            v.push(format!("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:vsbmc=1"));
+        }
         v.push(format!("fps={fps}"));
     } else {
         v = vec!["setpts=PTS-STARTPTS".to_string(), format!("fps={fps}")];
@@ -321,8 +394,8 @@ fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>,
             v.push("setsar=1".to_string());
         }
     }
-    for e in &c.effects {
-        let ef = effect_filter(e);
+    for (k, e) in c.effects.iter().enumerate() {
+        let ef = effect_filter(e, &format!("{}_{k}", c.id));
         if !ef.is_empty() {
             v.push(ef);
         }
@@ -334,7 +407,7 @@ fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>,
     let tout = c.transition_out;
     let uses_fade = |t: &Transition| matches!(t.kind, TransitionKind::Fade | TransitionKind::Zoom);
     let keyed_alpha = !c.anim.opacity.is_empty();
-    let chroma = c.effects.iter().any(|e| matches!(e, Effect::ChromaKey { .. }));
+    let chroma = c.effects.iter().any(|e| matches!(e, Effect::ChromaKey { .. } | Effect::Mask { .. } | Effect::Rotate { .. }));
     if uses_fade(&tin) || uses_fade(&tout) || keyed_alpha || chroma {
         v.push("format=yuva420p".to_string());
     }
@@ -544,6 +617,86 @@ fn atempo_chain(speed: f64) -> String {
 /// Build FFmpeg input arguments and the filter graph. Produces label [vout] when `video`
 /// and [aout] when `audio`. Returns (input args, filter graph, total duration).
 pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, audio: bool) -> (Vec<String>, String, f64) {
+    build_graph_ex(project, rw, rh, fps, video, audio, &GraphOpts { loudnorm: None, subs: true })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GraphOpts {
+    /// Normalise the final mix to this LUFS target.
+    pub loudnorm: Option<f32>,
+    /// Draw the project's subtitles.
+    pub subs: bool,
+}
+
+/// Composite a finished layer `lab` over `current`, honouring the clip's blend mode.
+/// Returns the label of the new base.
+#[allow(clippy::too_many_arguments)]
+fn composite(filters: &mut Vec<String>, current: &str, lab: &str, x: &str, y: &str, c: &Clip, n: usize, rw: u32, rh: u32, fps: u32, total: f64) -> String {
+    let next = format!("l{n}");
+    let gate = format!("enable='between(t,{},{})'", f(c.start), f(c.end()));
+    if c.blend == BlendMode::Normal {
+        filters.push(format!("[{current}][{lab}]overlay=x='{x}':y='{y}':eof_action=pass:{gate}[{next}]"));
+    } else {
+        // Blend modes need a full-frame layer: place the layer on a transparent canvas, blend that
+        // with the picture below, then use the layer's alpha as a mask so only its area changes.
+        filters.push(format!("color=c=black@0.0:s={rw}x{rh}:r={fps}:d={},format=rgba[cv{n}]", f(total)));
+        filters.push(format!("[cv{n}][{lab}]overlay=x='{x}':y='{y}':eof_action=pass:format=auto:{gate},split[lfa{n}][lfb{n}]"));
+        filters.push(format!("[lfa{n}]alphaextract[mk{n}]"));
+        filters.push(format!("[lfb{n}]format=yuv420p[lfc{n}]"));
+        filters.push(format!("[{current}]split[cs{n}a][cs{n}b]"));
+        filters.push(format!("[cs{n}a][lfc{n}]blend=all_mode={}[bl{n}]", c.blend.ff()));
+        filters.push(format!("[bl{n}][mk{n}]alphamerge[bm{n}]"));
+        filters.push(format!("[cs{n}b][bm{n}]overlay=eof_action=pass[{next}]"));
+    }
+    next
+}
+
+/// FFmpeg audio filters for a clip's pan / EQ / dynamics / space effects (trailing comma).
+fn audio_fx_chain(fx: &AudioFx) -> String {
+    let mut v: Vec<String> = vec![];
+    if fx.denoise > 0.01 {
+        v.push(format!("afftdn=nr={:.1}:nf=-45", 6.0 + fx.denoise.clamp(0.0, 1.0) * 30.0));
+    }
+    if fx.deess > 0.01 {
+        v.push(format!("deesser=i={:.2}:m=0.5:f=0.5", fx.deess.clamp(0.0, 1.0)));
+    }
+    if fx.eq_low.abs() > 0.05 {
+        v.push(format!("bass=g={:.1}:f=120", fx.eq_low));
+    }
+    if fx.eq_mid.abs() > 0.05 {
+        v.push(format!("equalizer=f=1000:t=q:w=0.8:g={:.1}", fx.eq_mid));
+    }
+    if fx.eq_high.abs() > 0.05 {
+        v.push(format!("treble=g={:.1}:f=6000", fx.eq_high));
+    }
+    if fx.compress > 0.01 {
+        let a = fx.compress.clamp(0.0, 1.0) as f64;
+        let thr_db = -12.0 - 24.0 * a;
+        v.push(format!("acompressor=threshold={:.5}:ratio={:.1}:attack=10:release=200:makeup={:.2}", 10f64.powf(thr_db / 20.0), 2.0 + 6.0 * a, 1.0 + 3.0 * a));
+    }
+    if fx.reverb > 0.01 {
+        let r = fx.reverb.clamp(0.0, 1.0);
+        v.push(format!("aecho=0.8:0.85:40|75|120|180:{:.2}|{:.2}|{:.2}|{:.2}", 0.5 * r, 0.4 * r, 0.3 * r, 0.2 * r));
+    }
+    if fx.echo_ms > 1.0 {
+        v.push(format!("aecho=0.8:0.88:{:.0}:{:.2}", fx.echo_ms.clamp(1.0, 2000.0), fx.echo_decay.clamp(0.0, 0.9)));
+    }
+    if fx.normalize {
+        v.push("loudnorm=I=-16:TP=-1.5:LRA=11".to_string());
+    }
+    if fx.pan.abs() > 0.005 {
+        let l = 1.0 - fx.pan.max(0.0);
+        let r = 1.0 + fx.pan.min(0.0);
+        v.push(format!("pan=stereo|c0={l:.3}*c0|c1={r:.3}*c1"));
+    }
+    if v.is_empty() {
+        String::new()
+    } else {
+        format!("{},", v.join(","))
+    }
+}
+
+pub fn build_graph_ex(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, audio: bool, opts: &GraphOpts) -> (Vec<String>, String, f64) {
     let total = project.duration();
     let mut args: Vec<String> = vec![];
 
@@ -572,13 +725,7 @@ pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, a
             layer_no += 1;
             let lab = format!("t{layer_no}");
             filters.push(format!("{},{}[{lab}]", title_source(c, spec, rw, rh, fps), chain.join(",")));
-            let next = format!("l{layer_no}");
-            filters.push(format!(
-                "[{current}][{lab}]overlay=x='{x}':y='{y}':eof_action=pass:enable='between(t,{},{})'[{next}]",
-                f(c.start),
-                f(c.end())
-            ));
-            current = next;
+            current = composite(&mut filters, &current, &lab, &x, &y, c, layer_no, rw, rh, fps, total);
             continue;
         }
 
@@ -608,13 +755,7 @@ pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, a
             let (chain, x, y) = layer_chain(c, rw, rh, fps, true);
             filters.push(format!("[{i}:v]{}[v{i}]", chain.join(",")));
             layer_no += 1;
-            let next = format!("l{layer_no}");
-            filters.push(format!(
-                "[{current}][v{i}]overlay=x='{x}':y='{y}':eof_action=pass:enable='between(t,{},{})'[{next}]",
-                f(c.start),
-                f(c.end())
-            ));
-            current = next;
+            current = composite(&mut filters, &current, &format!("v{i}"), &x, &y, c, layer_no, rw, rh, fps, total);
         }
 
         if wants_a {
@@ -632,6 +773,11 @@ pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, a
                 retime.push_str("areverse,");
             }
             retime.push_str(&atempo_chain(c.speed));
+            retime.push_str(&audio_fx_chain(&c.afx));
+            if !c.anim.volume.is_empty() {
+                let e = kf_expr(&c.anim.volume, &format!("(t+{:.4})", c.anim_offset), 1.0);
+                retime.push_str(&format!("volume=volume='{e}':eval=frame,"));
+            }
             filters.push(format!(
                 "[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,{retime}volume={:.3},{fades}adelay={ms}|{ms}[a{i}]",
                 c.volume
@@ -641,16 +787,31 @@ pub fn build_graph(project: &Project, rw: u32, rh: u32, fps: u32, video: bool, a
     }
 
     if video {
-        filters.push(format!("[{current}]format=yuv420p[vout]"));
+        let mut tail = String::new();
+        if opts.subs && !project.subtitles.is_empty() {
+            let srt = std::env::temp_dir().join("reelforge_subs.srt");
+            if std::fs::write(&srt, interchange::to_srt(&project.subtitles)).is_ok() {
+                let dir = if cfg!(windows) { ":fontsdir='C\\:/Windows/Fonts'" } else { "" };
+                tail = format!(
+                    "subtitles=filename='{}'{dir}:force_style='FontName=Segoe UI,Fontsize=18,PrimaryColour=&HFFFFFF&,OutlineColour=&H80000000&,BorderStyle=3,Outline=2,Shadow=0,MarginV=18',",
+                    esc_path(&srt)
+                );
+            }
+        }
+        filters.push(format!("[{current}]{tail}format=yuv420p[vout]"));
     }
     if audio {
         // A silent bed guarantees an audio stream of the full length, even with no audio clips.
         filters.push(format!("anullsrc=r=48000:cl=stereo,atrim=duration={}[asil]", f(total)));
         let n = audio_labels.len() + 1;
         filters.push(format!(
-            "[asil]{}amix=inputs={n}:duration=longest:normalize=0,alimiter=limit=0.95[aout]",
+            "[asil]{}amix=inputs={n}:duration=longest:normalize=0,alimiter=limit=0.95[amx]",
             audio_labels.join("")
         ));
+        match opts.loudnorm {
+            Some(l) => filters.push(format!("[amx]loudnorm=I={l:.1}:TP=-1.5:LRA=11[aout]")),
+            None => filters.push("[amx]anull[aout]".to_string()),
+        }
     }
     (args, filters.join(";"), total)
 }
@@ -779,7 +940,8 @@ pub fn build_args(project: &Project, s: &RenderSettings, out: &PathBuf) -> Resul
         .map(|x| x.to_string())
         .collect();
 
-    let (inputs, graph, _) = build_graph(project, rw, rh, fps, true, true);
+    let opts = GraphOpts { loudnorm: if s.loudnorm { Some(s.lufs) } else { None }, subs: s.burn_subs };
+    let (inputs, graph, _) = build_graph_ex(project, rw, rh, fps, true, true, &opts);
     args.extend(inputs);
     args.extend(["-filter_complex".to_string(), graph]);
     args.extend(["-map".to_string(), "[vout]".to_string(), "-map".to_string(), "[aout]".to_string()]);
@@ -788,6 +950,43 @@ pub fn build_args(project: &Project, s: &RenderSettings, out: &PathBuf) -> Resul
     args.extend(["-t".to_string(), f(total)]);
     args.push(out.to_string_lossy().into_owned());
     Ok(args)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Loudness {
+    /// Integrated loudness, LUFS.
+    pub integrated: f64,
+    /// Loudness range, LU.
+    pub range: f64,
+    /// True peak, dBTP.
+    pub true_peak: f64,
+}
+
+/// Parse the summary block `ebur128` prints at the end of a run.
+pub fn parse_ebur128(log: &str) -> Option<Loudness> {
+    let tail = &log[log.rfind("Summary:")?..];
+    let num = |key: &str| -> Option<f64> {
+        let i = tail.find(key)? + key.len();
+        tail[i..].trim_start().split_whitespace().next()?.parse().ok()
+    };
+    Some(Loudness { integrated: num("I:")?, range: num("LRA:")?, true_peak: num("Peak:")? })
+}
+
+/// Measure the loudness of the project's mixed audio (blocking; run on a thread).
+pub fn measure_loudness(project: &Project) -> Result<Loudness, String> {
+    if project.duration() <= 0.0 {
+        return Err("The timeline is empty.".into());
+    }
+    let (inputs, graph, _) = build_graph(project, 16, 16, 10, false, true);
+    let out = command("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-nostats", "-v", "info"])
+        .args(inputs)
+        .args(["-filter_complex", &format!("{graph};[aout]ebur128=peak=true:framelog=quiet[lo]"), "-map", "[lo]", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    parse_ebur128(&log).ok_or_else(|| "Could not read the loudness result from FFmpeg.".to_string())
 }
 
 pub fn start(ctx: egui::Context, project: Project, settings: RenderSettings) -> (Receiver<RenderMsg>, Arc<AtomicBool>) {
@@ -807,6 +1006,9 @@ pub fn start(ctx: egui::Context, project: Project, settings: RenderSettings) -> 
             Ok(a) => a,
             Err(e) => return send(RenderMsg::Failed(e)),
         };
+        if settings.sidecar_srt && !project.subtitles.is_empty() {
+            let _ = std::fs::write(out.with_extension("srt"), interchange::to_srt(&project.subtitles));
+        }
         let total_us = project.duration() * 1_000_000.0;
 
         let mut child = match command("ffmpeg")

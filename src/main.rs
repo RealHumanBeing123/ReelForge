@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod interchange;
 mod model;
 mod playback;
 mod preview;
 mod probe;
 mod record;
 mod render;
+mod scopes;
 mod util;
 
 fn main() -> eframe::Result<()> {

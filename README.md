@@ -50,6 +50,19 @@ The finished program is in the following folder: `target\release\reelforge.exe`.
   - **Change speed between two points:** set From and To (type a time or press *Playhead*), pick a speed and press *Apply to range*. The clip is split at both points and only the part in between changes speed, so you can slow down one moment or speed through a boring stretch. Trimming, splitting and snapping all understand speed and reverse. Timeline labels show `2x`, `0.5x` and `(rev)`.
 - **Zoom** (*Effects > + Add effect > Zoom in / Zoom out*): zooms smoothly across the whole clip. Set the Start and End zoom (0.25x to 4x), the Focus X / Y point that stays fixed on screen (0.5 / 0.5 is the centre), and whether the start and end are eased. To zoom in during only part of a video, split the clip first and add Zoom to the piece you want.
 
+### Professional editing tools
+- **Edits:** *Properties > Edit tools* has **slip** (change which part of the source plays), **slide** (move a clip while its neighbours absorb the change) and **roll** (move the cut between two touching clips), nudged by a frame or a second. Also **ripple delete** (Shift+Del), **lift** / **extract** the in-out range (Q / W), **extend edit** to the playhead (E), and **insert** / **overwrite** the selected media at the playhead (, and .).
+- **In / out points and markers:** I and O set the range (shown as a blue band on the ruler), Alt+X clears it. M drops a marker, Shift+Left/Right jump between markers, and *Mark > Markers list* renames or moves them. Markers and in/out points are snap targets. Export can render only the in-out range.
+- **Source monitor** (Y): scrub any clip in the bin, mark a part with Set in / Set out, and insert or overwrite just that part.
+- **Jog / shuttle:** L plays, and pressing it again doubles the speed (up to 8x); J halves it while playing, or steps back 1 s when stopped; K pauses.
+- **Audio:** per-clip pan, 3-band equaliser, compressor, noise reduction, de-esser, reverb, echo and loudness normalisation (*Properties > Audio effects*), a gain readout in dB, fades, **crossfade into the next clip**, **waveforms** on audio clips, audio-level keyframes, a **loudness meter** (Tools; LUFS, range and true peak) and optional loudness normalisation to a LUFS target on export.
+- **Colour:** lift / gamma / gain, temperature and tint, **LUT import** (.cube, .3dl and more), HSL secondary grading by colour band, curve presets, and **video scopes** (U): waveform, RGB parade, vectorscope, histogram.
+- **Compositing and effects:** blend modes (multiply, screen, overlay and more), soft-edged rectangle / ellipse masks, glow, lens distortion, rotate, pixelate, film grain, denoise and stabilise (needs an FFmpeg build with vidstab). Keyframes have easing (linear, in, out, in-out, hold), and also cover audio level.
+- **Speed:** besides range speed, **speed ramps** (smooth acceleration across a range) and optional frame interpolation for smoother slow motion.
+- **Media management:** search the bin by name, tag or bin, tag media, **proxy files** for smooth preview (Tools > Generate proxies; View > Use proxies; export always uses the originals), and relink missing media.
+- **Interchange and subtitles:** export a CMX3600 **EDL**; import / edit / export **SRT subtitles**, burned into the picture on export and/or written as a sidecar .srt.
+- **Customisation:** every command has a **rebindable shortcut** (Tools > Keyboard shortcuts), **macros** record and replay command sequences, and *View > Workspaces* (Editing, Color, Audio, Timeline focus) show or hide panels and scopes. Settings are saved in `%APPDATA%\ReelForge\config.json`.
+
 ### Preview
 - Real-time playback with audio (Space).
 - **Preview quality selector** next to the transport controls: Draft 360p, Standard 540p, **High 720p (default)**, Full HD 1080p. Higher settings use Lanczos scaling and accurate colour conversion for a sharper picture. If playback stutters on a slower PC, drop to a lower setting. Export is not affected by this setting.
@@ -76,6 +89,14 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 | Space | Play / pause |
 | S | Split at playhead |
 | F | Freeze frame at playhead |
+| I / O | Set in / out point (Alt+X clears) |
+| M | Add marker (Shift+Left / Right: previous / next) |
+| Shift+Del | Ripple delete |
+| Q / W | Lift / extract in-out range |
+| E | Extend edit to playhead |
+| , / . | Insert / overwrite selected media |
+| J / K / L | Shuttle slower / pause / faster |
+| Y / U | Source monitor / video scopes |
 | Del | Delete selected clip |
 | Left / Right | Step one frame |
 | Home / End | Jump to start / end |
@@ -93,7 +114,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 
 <img width="359" height="444" alt="RF5" src="https://github.com/user-attachments/assets/274e9e59-f387-49c3-8f2f-402ad50d3832" />
 
-## Known limitations (v0.5)
+## Known limitations (v0.6)
 
 - **This code has not been compiled or run on Windows by its author.** The FFmpeg commands it generates (export, preview, titles, recordings) were tested against FFmpeg 6.1 on Linux with synthetic inputs; the egui interface and the Windows capture devices (`gdigrab`, DirectShow) have not. Expect to fix a few compile errors on the first build.
 - Screen and voice recording use FFmpeg's `gdigrab` and DirectShow, so they work on Windows only. System-audio capture needs a loopback device such as "Stereo Mix", which many PCs have disabled by default.
@@ -103,6 +124,9 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 - The unsaved-changes prompt covers closing the program only. File > New and File > Open replace the current project without asking. Undoing back to the saved state still counts as changed.
 - **Speed / reverse / freeze:** changing a clip's length ripples later clips on the *same track only*. Audio on another track is not moved, so a sped-up video with separate voice-over can drift out of sync; keep them on one track or retime both. Reverse buffers every frame of the clip in memory, so use it on short clips (a few seconds to a minute, less at 4K), and the paused preview of a long reversed clip can be slow. Freeze frames are silent. Images and titles cannot be sped up (their length is set directly).
 - **Zoom** uses the first Zoom effect on a clip. Zooming in past 1x crops the picture; zooming out below 1x or moving the focus to an edge can reveal black background. The zoom is applied after other effects, and combines (multiplies) with scale keyframes.
+- **Not included:** multicam editing, planar / motion tracking, particle systems, 3D compositing and camera solve, optical-flow retiming beyond FFmpeg's interpolation, RAW camera formats, XML / AAF round-trips, DCP / IMF, watch folders, render farms and project collaboration. These are large features that FFmpeg cannot supply on its own.
+- Shuttle playback keyframes and subtitles keep their normal timing, so they appear slightly off while playing at other than 1x. Audio is sped up with the picture.
+- Proxies are for preview only. Loudness measurement and range export use the originals.
 - Keyframe times are relative to the clip start. Trimming a clip's left edge does not shift them. Splitting a clip keeps animation continuous.
 - Starting playback in the middle of a fade/zoom-in skips that transition's ramp for that session.
 - Title fonts are loaded from `C:\Windows\Fonts`. Titles are written to temp files, so a user name containing an apostrophe in the temp path can break title rendering.

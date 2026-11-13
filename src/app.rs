@@ -14,6 +14,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod ext;
+
 const TRACK_H: f32 = 54.0;
 const RULER_H: f32 = 24.0;
 const HEADER_W: f32 = 120.0;
@@ -97,6 +99,8 @@ pub struct ReelForge {
     preview_dirty: bool,
     last_req_time: f64,
     edit_stamp: Option<(u64, Instant)>,
+    ext: ext::Ext,
+    playback_rate: f64,
     freeze_len: f64,
     range_from: f64,
     range_to: f64,
@@ -180,6 +184,8 @@ impl ReelForge {
             preview_dirty: true,
             last_req_time: -1.0,
             edit_stamp: None,
+            ext: ext::Ext::load(),
+            playback_rate: 1.0,
             freeze_len: 2.0,
             range_from: 0.0,
             range_to: 1.0,
@@ -333,6 +339,9 @@ impl ReelForge {
                 has_audio: false,
                 video_codec: String::new(),
                 audio_codec: String::new(),
+                tag: String::new(),
+                bin: String::new(),
+                proxy: None,
             });
         }
         if c.freeze {
@@ -510,6 +519,7 @@ impl ReelForge {
         }
         while let Ok(fr) = self.preview_rx.try_recv() {
             self.preview_inflight = false;
+            self.ext_note_frame(fr.w, fr.h, &fr.rgba);
             let img = egui::ColorImage::from_rgba_unmultiplied([fr.w, fr.h], &fr.rgba);
             match &mut self.preview_tex {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
@@ -552,59 +562,7 @@ impl ReelForge {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
-            return;
-        }
-        use egui::{Key, Modifiers};
-        let (cmd, none) = (Modifiers::COMMAND, Modifiers::NONE);
-        let consume = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-
-        if consume(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || consume(cmd, Key::Y) {
-            self.do_redo();
-        } else if consume(cmd, Key::Z) {
-            self.do_undo();
-        }
-        if consume(cmd, Key::S) {
-            self.save_project(false);
-        }
-        if consume(cmd, Key::O) {
-            self.open_project(ctx);
-        }
-        if consume(cmd, Key::I) {
-            self.import_dialog(ctx);
-        }
-        if consume(cmd, Key::E) {
-            self.export_open = true;
-        }
-        if consume(none, Key::Space) {
-            self.toggle_play(ctx);
-        }
-        if consume(none, Key::S) {
-            self.split_at_playhead();
-        }
-        if consume(none, Key::F) {
-            self.freeze_at_playhead();
-        }
-        if consume(none, Key::Delete) || consume(none, Key::Backspace) {
-            self.delete_selected();
-        }
-        let frame = 1.0 / self.project.fps.max(1) as f64;
-        if consume(none, Key::ArrowLeft) {
-            self.stop_playback();
-            self.playhead = (self.playhead - frame).max(0.0);
-        }
-        if consume(none, Key::ArrowRight) {
-            self.stop_playback();
-            self.playhead += frame;
-        }
-        if consume(none, Key::Home) {
-            self.stop_playback();
-            self.playhead = 0.0;
-        }
-        if consume(none, Key::End) {
-            self.stop_playback();
-            self.playhead = self.project.duration();
-        }
+        self.ext_keys(ctx);
     }
 
     fn stop_playback(&mut self) {
@@ -626,7 +584,9 @@ impl ReelForge {
             self.playhead = 0.0;
         }
         let handle = self.audio.as_ref().map(|(_, h)| h);
-        match playback::start(ctx, &self.project, self.playhead, handle, self.preview_quality) {
+        let rate = self.playback_rate.clamp(0.25, 8.0);
+        let (proj, t0) = if (rate - 1.0).abs() > 1e-6 { (self.project.scaled(rate), self.playhead / rate) } else { (self.project.clone(), self.playhead) };
+        match playback::start(ctx, &proj, t0, handle, self.preview_quality) {
             Ok(pb) => {
                 self.playback = Some(pb);
                 self.playing = true;
@@ -682,6 +642,7 @@ impl ReelForge {
             }
         }
         if let Some(rgba) = show {
+            self.ext_note_frame(w, h, &rgba);
             let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
             match &mut self.preview_tex {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
@@ -689,7 +650,7 @@ impl ReelForge {
             }
         }
 
-        self.playhead = (t0 + elapsed).min(end);
+        self.playhead = ((t0 + elapsed) * self.playback_rate).min(end);
         if self.playhead >= end - 1e-3 || (disconnected && self.pending.is_none() && elapsed > 0.5 && self.next_idx as f64 / fps < elapsed) {
             self.playhead = end;
             self.stop_playback();
@@ -796,6 +757,7 @@ impl ReelForge {
                         ui.close_menu();
                     }
                 });
+                self.ext_menus(ui, ctx);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let btn = egui::Button::new(egui::RichText::new("  Export  ").strong()).fill(Color32::from_rgb(40, 120, 70));
                     if ui.add(btn).clicked() {
@@ -819,13 +781,41 @@ impl ReelForge {
                 });
             });
             ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Search");
+                ui.add(egui::TextEdit::singleline(&mut self.ext.search).hint_text("name, tag or bin").desired_width(f32::INFINITY));
+            });
             if self.project.media.is_empty() {
                 ui.add_space(20.0);
                 ui.label(egui::RichText::new("Drop video, audio or image files here,\nor click Import.").weak());
             }
-            let items = self.project.media.clone();
+            let q = self.ext.search.trim().to_lowercase();
+            let items: Vec<MediaItem> = self
+                .project
+                .media
+                .iter()
+                .filter(|m| q.is_empty() || m.name.to_lowercase().contains(&q) || m.tag.to_lowercase().contains(&q) || m.bin.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
             let mut remove: Option<u64> = None;
             let mut add: Option<u64> = None;
+            // tags / bin for the selected media item
+            if let Some(id) = self.selected_media {
+                if let Some(idx) = self.project.media.iter().position(|m| m.id == id) {
+                    let (mut tag, mut bin) = (self.project.media[idx].tag.clone(), self.project.media[idx].bin.clone());
+                    ui.horizontal(|ui| {
+                        ui.label("Tags");
+                        ui.add(egui::TextEdit::singleline(&mut tag).desired_width(80.0));
+                        ui.label("Bin");
+                        ui.add(egui::TextEdit::singleline(&mut bin).desired_width(70.0));
+                    });
+                    if tag != self.project.media[idx].tag || bin != self.project.media[idx].bin {
+                        self.project.media[idx].tag = tag;
+                        self.project.media[idx].bin = bin;
+                        self.revision += 1;
+                    }
+                }
+            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for m in &items {
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), Sense::click_and_drag());
@@ -859,7 +849,8 @@ impl ReelForge {
                     };
                     p.text(Pos2::new(tx, rect.top() + 32.0), Align2::LEFT_CENTER, info, FontId::proportional(11.0), Color32::GRAY);
                     let codecs = format!("{} {}", m.video_codec, m.audio_codec);
-                    p.text(Pos2::new(tx, rect.top() + 48.0), Align2::LEFT_CENTER, codecs.trim(), FontId::proportional(10.0), Color32::from_gray(120));
+                    let extra = [codecs.trim().to_string(), if m.bin.is_empty() { String::new() } else { format!("[{}]", m.bin) }, if m.proxy.is_some() { "proxy".to_string() } else { String::new() }].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join("  ");
+                    p.text(Pos2::new(tx, rect.top() + 48.0), Align2::LEFT_CENTER, extra, FontId::proportional(10.0), Color32::from_gray(120));
 
                     if resp.clicked() {
                         self.selected_media = Some(m.id);
@@ -908,6 +899,10 @@ impl ReelForge {
                     let playhead_rel = self.playhead - c.start;
                     let (mut do_split, mut do_delete, mut do_freeze) = (false, false, false);
                     let mut do_range: Option<(f64, f64, f64)> = None;
+                    let mut pending: Option<ext::ExtAction> = None;
+                    let fr = 1.0 / self.project.fps.max(1) as f64;
+                    let next_id = self.project.clips.iter().find(|n| n.track == orig.track && n.id != orig.id && (n.start - orig.end()).abs() < 1e-3).map(|n| n.id);
+                    let (ramp_s0, ramp_s1) = (&mut self.ext.ramp_s0, &mut self.ext.ramp_s1);
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         ui.label(egui::RichText::new(media.as_ref().map(|m| m.name.clone()).unwrap_or_default()).strong());
                         ui.add_space(4.0);
@@ -930,9 +925,14 @@ impl ReelForge {
                             if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").text("Volume")).changed() {
                                 c.volume = vol / 100.0;
                             }
+                            ui.label(egui::RichText::new(format!("Clip gain {:+.1} dB", 20.0 * (c.volume.max(0.0001) as f64).log10())).weak().small());
                             let hi = (c.duration / 2.0).max(0.5).max(c.audio_fade_in).max(c.audio_fade_out);
                             ui.add(egui::Slider::new(&mut c.audio_fade_in, 0.0..=hi).suffix(" s").text("Audio fade in"));
                             ui.add(egui::Slider::new(&mut c.audio_fade_out, 0.0..=hi).suffix(" s").text("Audio fade out"));
+                            if ui.add_enabled(next_id.is_some(), egui::Button::new("Crossfade into next clip")).on_hover_text("Fades this clip's audio out and the next clip's in across the cut (1 s)").clicked() {
+                                pending = Some(ext::ExtAction::Crossfade(c.id));
+                            }
+                            egui::CollapsingHeader::new("Audio effects").id_salt("afx").default_open(!c.afx.is_default()).show(ui, |ui| audio_fx_editor(ui, &mut c.afx));
                         }
                         if let Some(t) = c.title.as_mut() {
                             ui.add_space(8.0);
@@ -983,6 +983,17 @@ impl ReelForge {
                                     do_range = Some((a, b, self.range_speed));
                                 }
                                 ui.label(egui::RichText::new("Splits the clip at both points and changes only the part between them.").weak().small());
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Speed ramp").strong());
+                                ui.add(egui::Slider::new(&mut *ramp_s0, 0.1..=16.0).logarithmic(true).suffix("x").text("Start speed"));
+                                ui.add(egui::Slider::new(&mut *ramp_s1, 0.1..=16.0).logarithmic(true).suffix("x").text("End speed"));
+                                if ui.button("Apply ramp to range").clicked() {
+                                    pending = Some(ext::ExtAction::Ramp { id: c.id, a: self.range_from, b: self.range_to, s0: *ramp_s0, s1: *ramp_s1 });
+                                }
+                                ui.label(egui::RichText::new("Accelerates smoothly from the start to the end speed across the From-To range (10 steps).").weak().small());
+                                if is_video {
+                                    ui.checkbox(&mut c.interpolate, "Smooth slow motion (frame interpolation)");
+                                }
                             });
                         }
                         if is_video {
@@ -999,6 +1010,35 @@ impl ReelForge {
                         }
                         if c.freeze {
                             ui.label(egui::RichText::new("Freeze frame: drag the clip's edges or set Duration to change how long it holds.").weak().small());
+                        }
+                        if c.title.is_none() && !c.freeze {
+                            egui::CollapsingHeader::new("Edit tools").id_salt("edittools").default_open(false).show(ui, |ui| {
+                                let mut nudge = |ui: &mut egui::Ui, label: &str, hint: &str, mk: &dyn Fn(f64) -> Option<ext::ExtAction>, pending: &mut Option<ext::ExtAction>| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(label).on_hover_text(hint);
+                                        for (txt, d) in [("-1 s", -1.0), ("-1 fr", -fr), ("+1 fr", fr), ("+1 s", 1.0)] {
+                                            if ui.small_button(txt).clicked() {
+                                                *pending = mk(d);
+                                            }
+                                        }
+                                    });
+                                };
+                                let id = c.id;
+                                nudge(ui, "Slip", "Changes which part of the source plays; the clip keeps its place and length.", &|d| Some(ext::ExtAction::Slip(id, d)), &mut pending);
+                                nudge(ui, "Slide", "Moves the clip; the neighbours on either side absorb the change.", &|d| Some(ext::ExtAction::Slide(id, d)), &mut pending);
+                                if let Some(r) = next_id {
+                                    nudge(ui, "Roll", "Moves the cut between this clip and the next one.", &|d| Some(ext::ExtAction::Roll(id, r, d)), &mut pending);
+                                } else {
+                                    ui.label(egui::RichText::new("Roll needs a clip touching this one's end.").weak().small());
+                                }
+                            });
+                        }
+                        if !is_audio && c.title.is_none() {
+                            egui::ComboBox::from_label("Blend mode").selected_text(c.blend.label()).show_ui(ui, |ui| {
+                                for b in BlendMode::ALL {
+                                    ui.selectable_value(&mut c.blend, b, b.label());
+                                }
+                            });
                         }
                         if !is_audio {
                             let max_d = (c.duration / 2.0).clamp(0.2, 3.0);
@@ -1020,6 +1060,9 @@ impl ReelForge {
                         });
                     });
                     self.commit_clip_edit(&orig, c);
+                    if pending.is_some() {
+                        self.ext.action = pending;
+                    }
                     if do_split {
                         self.split_at_playhead();
                     }
@@ -1170,7 +1213,11 @@ impl ReelForge {
                 }
                 let label = if self.playing { "  Pause  " } else { "  Play  " };
                 if ui.button(label).clicked() {
+                    self.playback_rate = 1.0;
                     self.toggle_play(ctx);
+                }
+                if self.playing && (self.playback_rate - 1.0).abs() > 1e-6 {
+                    ui.label(egui::RichText::new(format!("{}x", self.playback_rate)).strong());
                 }
                 if ui.button(">|").clicked() {
                     self.stop_playback();
@@ -1364,6 +1411,32 @@ impl ReelForge {
         if ruler_resp.drag_stopped() || ruler_resp.clicked() {
             self.snap_marker = None;
         }
+        // in / out range and markers
+        if let (Some(a), Some(b)) = (self.project.mark_in, self.project.mark_out) {
+            let band = Rect::from_min_max(Pos2::new(tx(a.min(b), scroll).max(lane_left), ruler.bottom() - 6.0), Pos2::new(tx(a.max(b), scroll).max(lane_left), ruler.bottom()));
+            lane_painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(90, 170, 255, 150));
+        }
+        for (label, v) in [("I", self.project.mark_in), ("O", self.project.mark_out)] {
+            if let Some(t) = v {
+                let x = tx(t, scroll);
+                if x >= lane_left && x <= rect.right() {
+                    lane_painter.line_segment([Pos2::new(x, ruler.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, Color32::from_rgb(90, 170, 255)));
+                    lane_painter.text(Pos2::new(x + 2.0, ruler.top() + 20.0), Align2::LEFT_CENTER, label, FontId::proportional(10.0), Color32::from_rgb(120, 190, 255));
+                }
+            }
+        }
+        for mk in &self.project.markers {
+            let x = tx(mk.t, scroll);
+            if x >= lane_left && x <= rect.right() {
+                lane_painter.line_segment([Pos2::new(x, ruler.bottom()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 170, 60, 110)));
+                lane_painter.add(egui::Shape::convex_polygon(
+                    vec![Pos2::new(x - 5.0, ruler.top() + 1.0), Pos2::new(x + 5.0, ruler.top() + 1.0), Pos2::new(x, ruler.top() + 9.0)],
+                    Color32::from_rgb(255, 170, 60),
+                    Stroke::NONE,
+                ));
+                lane_painter.text(Pos2::new(x + 7.0, ruler.top() + 20.0), Align2::LEFT_CENTER, elide(&mk.name, 14), FontId::proportional(10.0), Color32::from_rgb(255, 190, 100));
+            }
+        }
 
         // track rows (highest track on top)
         self.track_rects.clear();
@@ -1429,6 +1502,15 @@ impl ReelForge {
                     let th = Rect::from_min_size(r.min + Vec2::new(2.0, 2.0), Vec2::new(r.height() * 16.0 / 9.0 - 4.0, r.height() - 4.0));
                     let th = th.intersect(r.shrink(1.0));
                     lane_painter.image(tex.id(), th, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha(160));
+                }
+            }
+            if m.kind == MediaKind::Audio && m.duration > 0.0 {
+                if let Some(tex) = self.ext_wave(m.id) {
+                    let a = (c.in_point / m.duration).clamp(0.0, 1.0) as f32;
+                    let b = ((c.in_point + c.src_span()) / m.duration).clamp(0.0, 1.0) as f32;
+                    let (u0, u1) = if c.reverse { (b, a) } else { (a, b) };
+                    let wr = Rect::from_min_max(r.min + Vec2::new(1.0, 14.0), r.max - Vec2::new(1.0, 2.0));
+                    lane_painter.image(tex.id(), wr, Rect::from_min_max(Pos2::new(u0, 0.0), Pos2::new(u1, 1.0)), Color32::from_white_alpha(210));
                 }
             }
             let label_pos = Pos2::new((r.left().max(lane_left)) + 6.0, r.top() + 12.0);
@@ -1919,6 +2001,21 @@ impl ReelForge {
         egui::Window::new("Export video").open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
             ui.add_enabled_ui(!rendering, |ui| {
                 settings_grid(ui, &mut self.settings, GridMode::Export, (ow, oh), dur);
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Audio, subtitles and range").strong());
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.loudnorm, "Normalize loudness to");
+                    ui.add_enabled(self.settings.loudnorm, egui::DragValue::new(&mut self.settings.lufs).range(-30.0..=-6.0).speed(0.1).suffix(" LUFS"));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!self.project.subtitles.is_empty(), |ui| {
+                        ui.checkbox(&mut self.settings.burn_subs, "Burn subtitles into picture");
+                        ui.checkbox(&mut self.settings.sidecar_srt, "Also write .srt");
+                    });
+                });
+                let has_range = matches!((self.project.mark_in, self.project.mark_out), (Some(a), Some(b)) if (b - a).abs() > 0.05);
+                ui.add_enabled(has_range, egui::Checkbox::new(&mut self.settings.use_range, "Export only the in-out range"));
             });
 
             ui.add_space(10.0);
@@ -1958,7 +2055,11 @@ impl ReelForge {
             self.settings.normalize();
             self.render_progress = 0.0;
             self.render_msg.clear();
-            let (rx, c) = render::start(ctx.clone(), self.project.clone(), self.settings.clone());
+            let to_render = match (self.project.mark_in, self.project.mark_out) {
+                (Some(a), Some(b)) if self.settings.use_range && (b - a).abs() > 0.05 => self.project.range(a.min(b), a.max(b)),
+                _ => self.project.clone(),
+            };
+            let (rx, c) = render::start(ctx.clone(), to_render, self.settings.clone());
             self.render_rx = Some(rx);
             self.render_cancel = c;
         }
@@ -2237,6 +2338,75 @@ fn effects_editor(ui: &mut egui::Ui, effects: &mut Vec<Effect>) {
                 ui.checkbox(ease, "Smooth start / end");
                 ui.label(egui::RichText::new("Zooms steadily over the whole clip. The focus point stays fixed on screen.").weak().small());
             }
+            Effect::ColorWheels { lift, gamma, gain } => {
+                ui.label(egui::RichText::new("R / G / B offsets").weak().small());
+                rgb_row(ui, "Lift (shadows)", lift);
+                rgb_row(ui, "Gamma (mids)", gamma);
+                rgb_row(ui, "Gain (highlights)", gain);
+            }
+            Effect::Temperature { kelvin, tint } => {
+                ui.add(egui::Slider::new(kelvin, 2000.0..=12000.0).suffix(" K").text("Temperature"));
+                ui.add(egui::Slider::new(tint, -1.0..=1.0).text("Tint (green - magenta)"));
+            }
+            Effect::Lut { path } => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(path).desired_width(120.0).hint_text("LUT file"));
+                    if ui.button("Browse...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("3D LUT", &["cube", "3dl", "dat", "m3d", "csp"]).pick_file() {
+                            *path = p.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+            }
+            Effect::HslAdjust { band, hue, sat, intensity } => {
+                egui::ComboBox::from_id_salt(("hslband", i)).selected_text(band.label()).show_ui(ui, |ui| {
+                    for b in HslBand::ALL {
+                        ui.selectable_value(band, b, b.label());
+                    }
+                });
+                ui.add(egui::Slider::new(hue, -180.0..=180.0).suffix(" deg").text("Hue"));
+                ui.add(egui::Slider::new(sat, -1.0..=1.0).text("Saturation"));
+                ui.add(egui::Slider::new(intensity, -1.0..=1.0).text("Intensity"));
+            }
+            Effect::Curves { preset } => {
+                egui::ComboBox::from_id_salt(("curves", i)).selected_text(preset.label()).show_ui(ui, |ui| {
+                    for p in CurvePreset::ALL {
+                        ui.selectable_value(preset, p, p.label());
+                    }
+                });
+            }
+            Effect::Glow { radius, strength } => {
+                ui.add(egui::Slider::new(radius, 2.0..=100.0).text("Radius"));
+                ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength"));
+            }
+            Effect::Distort { amount } => {
+                ui.add(egui::Slider::new(amount, -1.0..=1.0).text("Amount (+ barrel / - pincushion)"));
+            }
+            Effect::Rotate { degrees } => {
+                ui.add(egui::Slider::new(degrees, -180.0..=180.0).suffix(" deg").text("Angle"));
+            }
+            Effect::Pixelate { block } => {
+                ui.add(egui::Slider::new(block, 2.0..=80.0).text("Block size"));
+            }
+            Effect::Grain { amount } => {
+                ui.add(egui::Slider::new(amount, 0.0..=60.0).text("Amount"));
+            }
+            Effect::Denoise { strength } => {
+                ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength"));
+            }
+            Effect::Stabilize { strength } => {
+                ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength"));
+                ui.label(egui::RichText::new("Smooths camera shake (needs an FFmpeg build with vidstab).").weak().small());
+            }
+            Effect::Mask { ellipse, cx, cy, w, h, feather, invert } => {
+                ui.checkbox(ellipse, "Ellipse (off = rectangle)");
+                ui.add(egui::Slider::new(cx, 0.0..=1.0).text("Centre X"));
+                ui.add(egui::Slider::new(cy, 0.0..=1.0).text("Centre Y"));
+                ui.add(egui::Slider::new(w, 0.05..=1.0).text("Width"));
+                ui.add(egui::Slider::new(h, 0.05..=1.0).text("Height"));
+                ui.add(egui::Slider::new(feather, 0.0..=0.5).text("Feather"));
+                ui.checkbox(invert, "Invert mask");
+            }
             _ => {}
         }
         ui.separator();
@@ -2254,6 +2424,33 @@ fn effects_editor(ui: &mut egui::Ui, effects: &mut Vec<Effect>) {
     });
 }
 
+fn audio_fx_editor(ui: &mut egui::Ui, a: &mut AudioFx) {
+    ui.add(egui::Slider::new(&mut a.pan, -1.0..=1.0).text("Pan"));
+    ui.label(egui::RichText::new("Equalizer").strong());
+    ui.add(egui::Slider::new(&mut a.eq_low, -12.0..=12.0).suffix(" dB").text("Low"));
+    ui.add(egui::Slider::new(&mut a.eq_mid, -12.0..=12.0).suffix(" dB").text("Mid"));
+    ui.add(egui::Slider::new(&mut a.eq_high, -12.0..=12.0).suffix(" dB").text("High"));
+    ui.add(egui::Slider::new(&mut a.compress, 0.0..=1.0).text("Compressor"));
+    ui.add(egui::Slider::new(&mut a.denoise, 0.0..=1.0).text("Noise reduction"));
+    ui.add(egui::Slider::new(&mut a.deess, 0.0..=1.0).text("De-esser"));
+    ui.add(egui::Slider::new(&mut a.reverb, 0.0..=1.0).text("Reverb"));
+    ui.add(egui::Slider::new(&mut a.echo_ms, 0.0..=1000.0).suffix(" ms").text("Echo delay"));
+    ui.add(egui::Slider::new(&mut a.echo_decay, 0.0..=0.9).text("Echo feedback"));
+    ui.checkbox(&mut a.normalize, "Normalize loudness");
+    if ui.small_button("Reset audio effects").clicked() {
+        *a = AudioFx::default();
+    }
+}
+
+fn rgb_row(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3]) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        for x in v.iter_mut() {
+            ui.add(egui::DragValue::new(x).speed(0.005).range(-1.0..=1.0).fixed_decimals(2));
+        }
+    });
+}
+
 fn anim_editor(ui: &mut egui::Ui, anim: &mut Anim, rel_t: f64, dur: f64) {
     for p in AnimProp::ALL {
         let n = anim.track(p).len();
@@ -2264,6 +2461,11 @@ fn anim_editor(ui: &mut egui::Ui, anim: &mut Anim, rel_t: f64, dur: f64) {
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut k.t).range(0.0..=dur).speed(0.02).fixed_decimals(2).suffix(" s"));
                     ui.add(egui::DragValue::new(&mut k.v).range(p.range()).speed(0.01).fixed_decimals(2));
+                    egui::ComboBox::from_id_salt(("ease", i)).width(64.0).selected_text(k.ease.label()).show_ui(ui, |ui| {
+                        for e in Ease::ALL {
+                            ui.selectable_value(&mut k.ease, e, e.label());
+                        }
+                    });
                     if ui.small_button("Remove").clicked() {
                         remove = Some(i);
                     }
@@ -2279,7 +2481,7 @@ fn anim_editor(ui: &mut egui::Ui, anim: &mut Anim, rel_t: f64, dur: f64) {
                 if let Some(k) = kfs.iter_mut().find(|k| (k.t - t).abs() < 0.02) {
                     k.v = v;
                 } else {
-                    kfs.push(Keyframe { t, v });
+                    kfs.push(Keyframe::new(t, v));
                     kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
                 }
             }
@@ -2314,6 +2516,7 @@ impl eframe::App for ReelForge {
 
         self.poll(ctx);
         self.poll_recorder(ctx);
+        self.ext_poll(ctx);
         self.handle_drops(ctx);
         self.handle_keys(ctx);
         self.advance_playback(ctx);
@@ -2321,10 +2524,15 @@ impl eframe::App for ReelForge {
 
         self.menu_bar(ctx);
         self.timeline_panel(ctx);
-        self.media_panel(ctx);
-        self.props_panel(ctx);
+        if self.ext.cfg.show_media {
+            self.media_panel(ctx);
+        }
+        if self.ext.cfg.show_props {
+            self.props_panel(ctx);
+        }
         self.preview_panel(ctx);
         self.export_window(ctx);
+        self.ext_windows(ctx);
         self.record_window(ctx);
         self.close_dialog(ctx);
         self.finish_media_drag(ctx);
