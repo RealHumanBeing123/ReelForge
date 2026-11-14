@@ -9,6 +9,7 @@ mod probe;
 mod record;
 mod render;
 mod scopes;
+mod tracker;
 mod util;
 
 fn main() -> eframe::Result<()> {

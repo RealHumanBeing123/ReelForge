@@ -306,7 +306,14 @@ pub enum Effect {
     Vignette,
     FlipH,
     FlipV,
-    ChromaKey { color: [u8; 3], similarity: f32, blend: f32 },
+    /// `spill` (0..1) removes the key colour's tint from edges and hair.
+    ChromaKey {
+        color: [u8; 3],
+        similarity: f32,
+        blend: f32,
+        #[serde(default)]
+        spill: f32,
+    },
     /// Animated zoom from `from` to `to` (1.0 = normal) over the clip, centred on (fx, fy) in 0..1.
     Zoom { from: f32, to: f32, fx: f32, fy: f32, ease: bool },
     /// Lift / gamma / gain as per-channel (R, G, B) offsets in -1..1 for shadows / mids / highlights.
@@ -342,7 +349,7 @@ impl Effect {
             Effect::Vignette,
             Effect::FlipH,
             Effect::FlipV,
-            Effect::ChromaKey { color: [0, 255, 0], similarity: 0.15, blend: 0.1 },
+            Effect::ChromaKey { color: [0, 255, 0], similarity: 0.15, blend: 0.1, spill: 0.5 },
             Effect::Zoom { from: 1.0, to: 1.5, fx: 0.5, fy: 0.5, ease: true },
             Effect::Zoom { from: 1.5, to: 1.0, fx: 0.5, fy: 0.5, ease: true },
             Effect::ColorWheels { lift: [0.0; 3], gamma: [0.0; 3], gain: [0.0; 3] },
@@ -392,6 +399,111 @@ impl Effect {
             Effect::Denoise { .. } => "Video denoise",
             Effect::Stabilize { .. } => "Stabilize",
             Effect::Mask { .. } => "Mask (shape, feather)",
+        }
+    }
+}
+
+/// How speed changes across a speed ramp.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RampCurve {
+    Linear,
+    #[default]
+    Smooth,
+    /// Changes quickly at first, then settles.
+    FastStart,
+    /// Holds the starting speed, then changes quickly at the end.
+    SlowStart,
+}
+
+impl RampCurve {
+    pub const ALL: [RampCurve; 4] = [RampCurve::Linear, RampCurve::Smooth, RampCurve::FastStart, RampCurve::SlowStart];
+    pub fn label(self) -> &'static str {
+        match self {
+            RampCurve::Linear => "Linear",
+            RampCurve::Smooth => "Smooth (ease in-out)",
+            RampCurve::FastStart => "Fast start (ease out)",
+            RampCurve::SlowStart => "Slow start (ease in)",
+        }
+    }
+    /// Progress 0..1 -> fraction of the speed change.
+    pub fn shape(self, p: f64) -> f64 {
+        let p = p.clamp(0.0, 1.0);
+        match self {
+            RampCurve::Linear => p,
+            RampCurve::Smooth => p * p * (3.0 - 2.0 * p),
+            RampCurve::FastStart => 1.0 - (1.0 - p) * (1.0 - p),
+            RampCurve::SlowStart => p * p,
+        }
+    }
+}
+
+/// Ready-made entrance / exit animations for titles (and any clip), built from keyframes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnimPreset {
+    FadeIn,
+    FadeInOut,
+    SlideUp,
+    SlideInLeft,
+    Pop,
+    ZoomOutReveal,
+    Drop,
+    Drift,
+}
+
+impl AnimPreset {
+    pub const ALL: [AnimPreset; 8] = [
+        AnimPreset::FadeIn,
+        AnimPreset::FadeInOut,
+        AnimPreset::SlideUp,
+        AnimPreset::SlideInLeft,
+        AnimPreset::Pop,
+        AnimPreset::ZoomOutReveal,
+        AnimPreset::Drop,
+        AnimPreset::Drift,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            AnimPreset::FadeIn => "Fade in",
+            AnimPreset::FadeInOut => "Fade in and out",
+            AnimPreset::SlideUp => "Slide up",
+            AnimPreset::SlideInLeft => "Slide in from left",
+            AnimPreset::Pop => "Pop (scale bounce)",
+            AnimPreset::ZoomOutReveal => "Zoom-out reveal",
+            AnimPreset::Drop => "Drop in",
+            AnimPreset::Drift => "Slow drift",
+        }
+    }
+
+    /// Replace the clip's opacity / scale / position keyframes with this preset.
+    pub fn apply(self, a: &mut Anim, dur: f64) {
+        let d = dur.max(0.2);
+        let e = (d * 0.25).clamp(0.2, 0.8); // length of the entrance
+        let kf = |t: f64, v: f64, ease: Ease| Keyframe { t, v, ease };
+        a.opacity.clear();
+        a.scale.clear();
+        a.pos_x.clear();
+        a.pos_y.clear();
+        match self {
+            AnimPreset::FadeIn => a.opacity = vec![kf(0.0, 0.0, Ease::Out), kf(e, 1.0, Ease::Linear)],
+            AnimPreset::FadeInOut => a.opacity = vec![kf(0.0, 0.0, Ease::Out), kf(e, 1.0, Ease::Linear), kf((d - e).max(e + 0.05), 1.0, Ease::In), kf(d, 0.0, Ease::Linear)],
+            AnimPreset::SlideUp => {
+                a.pos_y = vec![kf(0.0, 0.12, Ease::Out), kf(e, 0.0, Ease::Linear)];
+                a.opacity = vec![kf(0.0, 0.0, Ease::Out), kf(e, 1.0, Ease::Linear)];
+            }
+            AnimPreset::SlideInLeft => {
+                a.pos_x = vec![kf(0.0, -0.3, Ease::Out), kf(e, 0.0, Ease::Linear)];
+                a.opacity = vec![kf(0.0, 0.0, Ease::Out), kf(e * 0.7, 1.0, Ease::Linear)];
+            }
+            AnimPreset::Pop => a.scale = vec![kf(0.0, 0.3, Ease::Out), kf(e * 0.6, 1.15, Ease::InOut), kf(e, 1.0, Ease::Linear)],
+            AnimPreset::ZoomOutReveal => {
+                a.scale = vec![kf(0.0, 1.8, Ease::Out), kf(e * 1.5, 1.0, Ease::Linear)];
+                a.opacity = vec![kf(0.0, 0.0, Ease::Out), kf(e, 1.0, Ease::Linear)];
+            }
+            AnimPreset::Drop => a.pos_y = vec![kf(0.0, -0.35, Ease::In), kf(e * 0.7, 0.02, Ease::Out), kf(e, 0.0, Ease::Linear)],
+            AnimPreset::Drift => {
+                a.pos_x = vec![kf(0.0, -0.02, Ease::InOut), kf(d, 0.02, Ease::Linear)];
+                a.opacity = vec![kf(0.0, 0.0, Ease::Out), kf(e, 1.0, Ease::Linear)];
+            }
         }
     }
 }
@@ -1344,6 +1456,12 @@ impl Project {
     /// Speed ramp: change speed gradually from `s0` to `s1` across `t0..t1` of a clip, in
     /// `steps` pieces (smooth velocity curve). Returns false if the range is not usable.
     pub fn speed_ramp(&mut self, clip_id: u64, t0: f64, t1: f64, s0: f64, s1: f64, steps: usize) -> bool {
+        self.speed_ramp_ex(clip_id, t0, t1, s0, s1, steps, RampCurve::Smooth)
+    }
+
+    /// Like `speed_ramp`, with a choice of velocity curve.
+    #[allow(clippy::too_many_arguments)]
+    pub fn speed_ramp_ex(&mut self, clip_id: u64, t0: f64, t1: f64, s0: f64, s1: f64, steps: usize, curve: RampCurve) -> bool {
         let steps = steps.clamp(2, 40);
         let Some(mid) = self.apply_speed_range(clip_id, t0, t1, s0) else { return false };
         let Some(m) = self.clip(mid).cloned() else { return false };
@@ -1362,7 +1480,7 @@ impl Project {
         let n = ids.len() as f64;
         for (k, id) in ids.iter().enumerate() {
             let p = (k as f64 + 0.5) / n;
-            let e = p * p * (3.0 - 2.0 * p);
+            let e = curve.shape(p);
             let sp = (s0 + (s1 - s0) * e).clamp(0.1, 16.0);
             let Some(c) = self.clip(*id).cloned() else { continue };
             let new_d = c.duration * c.speed / sp;

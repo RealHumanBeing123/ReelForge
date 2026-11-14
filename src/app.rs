@@ -2,6 +2,7 @@ use crate::model::*;
 use crate::playback::{self, Playback};
 use crate::preview::{self, PreviewFrame, PreviewReq, Thumb};
 use crate::probe;
+use crate::tracker::{self, TrackPoint};
 use crate::record::{self, CaptureMode, Recorder, ScreenOptions};
 use crate::render::{self, AudioCodec, Container, RateControl, RenderMsg, RenderSettings, Speed, RESOLUTIONS};
 use crate::util::{self, fmt_time};
@@ -33,6 +34,14 @@ enum RecKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Result of a point-tracking run, kept until it is attached to another clip.
+struct TrackData {
+    clip_id: u64,
+    /// Seconds into the clip where tracking began.
+    t0: f64,
+    pts: Vec<TrackPoint>,
+}
+
 enum GridMode {
     Export,
     Screen,
@@ -100,6 +109,11 @@ pub struct ReelForge {
     last_req_time: f64,
     edit_stamp: Option<(u64, Instant)>,
     ext: ext::Ext,
+    track_pick: bool,
+    track_pt: (f32, f32),
+    track_rx: Option<Receiver<Result<(u64, f64, Vec<TrackPoint>), String>>>,
+    track_data: Option<TrackData>,
+    track_target: Option<u64>,
     batch: std::collections::VecDeque<RenderSettings>,
     batch_total: usize,
     batch_dir: Option<PathBuf>,
@@ -191,6 +205,11 @@ impl ReelForge {
             last_req_time: -1.0,
             edit_stamp: None,
             ext: ext::Ext::load(),
+            track_pick: false,
+            track_pt: (0.5, 0.5),
+            track_rx: None,
+            track_data: None,
+            track_target: None,
             batch: Default::default(),
             batch_total: 0,
             batch_dir: None,
@@ -327,6 +346,54 @@ impl ReelForge {
             }
             None => self.status = "Park the playhead over a video clip to freeze its frame.".into(),
         }
+    }
+
+    /// Start tracking the picked point of the selected video clip, forward from the playhead.
+    fn start_tracking(&mut self, ctx: &egui::Context) {
+        let Some(c) = self.selected.and_then(|id| self.project.clip(id)).cloned() else { return };
+        let Some(m) = self.project.media(c.media_id).cloned() else { return };
+        if m.kind != MediaKind::Video || c.reverse || c.freeze {
+            self.status = "Tracking works on normal-direction video clips.".into();
+            return;
+        }
+        let t0 = (self.playhead - c.start).clamp(0.0, c.duration - 0.2);
+        let from = c.in_point + t0 * c.speed;
+        let secs = (c.duration - t0) * c.speed;
+        let (path, pt, tx, ctx2) = (m.path.clone(), self.track_pt, channel(), ctx.clone());
+        let (sender, receiver) = tx;
+        self.track_rx = Some(receiver);
+        self.track_data = None;
+        self.status = "Tracking... (runs in the background)".into();
+        let id = c.id;
+        std::thread::spawn(move || {
+            let r = tracker::track_point(&path, from, secs, m.width, m.height, pt).map(|p| (id, t0, p));
+            let _ = sender.send(r);
+            ctx2.request_repaint();
+        });
+    }
+
+    /// Make `target` follow the tracked point: centre it on the point with position keyframes.
+    fn attach_track(&mut self, target: u64) {
+        let Some(data) = &self.track_data else { return };
+        let Some(src) = self.project.clip(data.clip_id).cloned() else { return };
+        let Some(m) = self.project.media(src.media_id).cloned() else { return };
+        let Some(tgt) = self.project.clip(target).cloned() else { return };
+        let t_offset = (src.start + data.t0) - tgt.start;
+        let (kx, ky) = tracker::to_keyframes(&data.pts, (m.width, m.height), (self.project.width, self.project.height), t_offset, src.speed, tgt.duration);
+        if kx.is_empty() {
+            self.status = "The tracked clip and the target do not overlap in time.".into();
+            return;
+        }
+        self.push_undo();
+        if let Some(c) = self.project.clip_mut(target) {
+            c.anim.pos_x = kx;
+            c.anim.pos_y = ky;
+            if let Some(t) = c.title.as_mut() {
+                t.pos = None;
+                t.position = TitlePos::Center;
+            }
+        }
+        self.status = "Attached: the clip now follows the tracked point (see its Animation keyframes).".into();
     }
 
     fn delete_selected(&mut self) {
@@ -515,6 +582,18 @@ impl ReelForge {
     // ---------------------------------------------------------------- per-frame plumbing
 
     fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.track_rx {
+            if let Ok(r) = rx.try_recv() {
+                match r {
+                    Ok((clip_id, t0, pts)) => {
+                        self.status = format!("Tracking finished: {} points. Choose a clip to attach it to.", pts.len());
+                        self.track_data = Some(TrackData { clip_id, t0, pts });
+                    }
+                    Err(e) => self.status = format!("Tracking failed: {e}"),
+                }
+                self.track_rx = None;
+            }
+        }
         while let Ok(r) = self.probe_rx.try_recv() {
             match r {
                 Ok(mut m) => {
@@ -1101,10 +1180,20 @@ impl ReelForge {
                     let mut do_range: Option<(f64, f64, f64)> = None;
                     let mut pending: Option<ext::ExtAction> = None;
                     let mut save_fx = false;
+                    let (mut track_go, mut track_attach): (bool, Option<u64>) = (false, None);
+                    let track_targets: Vec<(u64, String)> = self
+                        .project
+                        .clips
+                        .iter()
+                        .filter(|t| t.id != orig.id)
+                        .filter_map(|t| self.media_for(t).map(|m| (t.id, m.name)))
+                        .collect();
+                    let has_track = self.track_data.as_ref().map_or(false, |d| d.clip_id == orig.id);
+                    let tracking = self.track_rx.is_some();
                     let fx_presets: Vec<ext::FxPreset> = self.ext.cfg.fx_presets.clone();
                     let fr = 1.0 / self.project.fps.max(1) as f64;
                     let next_id = self.project.clips.iter().find(|n| n.track == orig.track && n.id != orig.id && (n.start - orig.end()).abs() < 1e-3).map(|n| n.id);
-                    let (ramp_s0, ramp_s1) = (&mut self.ext.ramp_s0, &mut self.ext.ramp_s1);
+                    let (ramp_s0, ramp_s1, ramp_curve) = (&mut self.ext.ramp_s0, &mut self.ext.ramp_s1, &mut self.ext.ramp_curve);
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         ui.label(egui::RichText::new(media.as_ref().map(|m| m.name.clone()).unwrap_or_default()).strong());
                         ui.add_space(4.0);
@@ -1189,10 +1278,15 @@ impl ReelForge {
                                 ui.label(egui::RichText::new("Speed ramp").strong());
                                 ui.add(egui::Slider::new(&mut *ramp_s0, 0.1..=16.0).logarithmic(true).suffix("x").text("Start speed"));
                                 ui.add(egui::Slider::new(&mut *ramp_s1, 0.1..=16.0).logarithmic(true).suffix("x").text("End speed"));
+                                egui::ComboBox::from_id_salt("ramp_curve").selected_text(ramp_curve.label()).show_ui(ui, |ui| {
+                                    for rc in RampCurve::ALL {
+                                        ui.selectable_value(&mut *ramp_curve, rc, rc.label());
+                                    }
+                                });
                                 if ui.button("Apply ramp to range").clicked() {
-                                    pending = Some(ext::ExtAction::Ramp { id: c.id, a: self.range_from, b: self.range_to, s0: *ramp_s0, s1: *ramp_s1 });
+                                    pending = Some(ext::ExtAction::Ramp { id: c.id, a: self.range_from, b: self.range_to, s0: *ramp_s0, s1: *ramp_s1, curve: *ramp_curve });
                                 }
-                                ui.label(egui::RichText::new("Accelerates smoothly from the start to the end speed across the From-To range (10 steps).").weak().small());
+                                ui.label(egui::RichText::new("Accelerates smoothly from the start to the end speed across the From-To range (12 steps).").weak().small());
                                 if is_video {
                                     ui.checkbox(&mut c.interpolate, "Smooth slow motion (frame interpolation)");
                                 }
@@ -1278,7 +1372,46 @@ impl ReelForge {
                                     }
                                 });
                             });
+                            if is_video {
+                                egui::CollapsingHeader::new("Motion tracking").id_salt("tracking").default_open(false).show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Follow a spot on the video, then make a title or another clip stick to it.").weak().small());
+                                    ui.add(egui::Slider::new(&mut self.track_pt.0, 0.0..=1.0).text("Point X"));
+                                    ui.add(egui::Slider::new(&mut self.track_pt.1, 0.0..=1.0).text("Point Y"));
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(self.track_pick, "Pick on preview").clicked() {
+                                            self.track_pick = !self.track_pick;
+                                        }
+                                        if ui.add_enabled(!tracking, egui::Button::new("Track from playhead")).clicked() {
+                                            track_go = true;
+                                        }
+                                        if tracking {
+                                            ui.spinner();
+                                        }
+                                    });
+                                    if has_track {
+                                        ui.label(format!("Tracked {} points.", self.track_data.as_ref().map_or(0, |d| d.pts.len())));
+                                        let cur = self.track_target.and_then(|id| track_targets.iter().find(|t| t.0 == id)).map(|t| elide(&t.1, 24)).unwrap_or_else(|| "Choose a clip...".into());
+                                        egui::ComboBox::from_id_salt("track_target").selected_text(cur).show_ui(ui, |ui| {
+                                            for (id, name) in &track_targets {
+                                                ui.selectable_value(&mut self.track_target, Some(*id), elide(name, 30));
+                                            }
+                                        });
+                                        if ui.add_enabled(self.track_target.is_some(), egui::Button::new("Attach clip to track")).clicked() {
+                                            track_attach = self.track_target;
+                                        }
+                                    }
+                                    ui.label(egui::RichText::new("Tracks forward from the playhead. Works best on high-contrast spots that stay visible. Tracks the raw picture, so clips with zoom or scale keyframes will not line up exactly.").weak().small());
+                                });
+                            }
                             egui::CollapsingHeader::new("Animation (keyframes)").default_open(true).show(ui, |ui| {
+                                egui::ComboBox::from_id_salt("anim_preset").selected_text("Animation presets...").show_ui(ui, |ui| {
+                                    for p in AnimPreset::ALL {
+                                        if ui.button(p.label()).on_hover_text("Replaces this clip's opacity / scale / position keyframes").clicked() {
+                                            p.apply(&mut c.anim, c.duration);
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
                                 anim_editor(ui, &mut c.anim, playhead_rel, c.duration);
                             });
                         }
@@ -1291,6 +1424,12 @@ impl ReelForge {
                     self.commit_clip_edit(&orig, c);
                     if save_fx {
                         self.ext.save_cfg();
+                    }
+                    if track_go {
+                        self.start_tracking(ctx);
+                    }
+                    if let Some(t) = track_attach {
+                        self.attach_track(t);
                     }
                     if pending.is_some() {
                         self.ext.action = pending;
@@ -1373,6 +1512,40 @@ impl ReelForge {
             ui.painter().rect_filled(canvas, 0.0, Color32::BLACK);
             if let Some(tex) = &self.preview_tex {
                 ui.painter().image(tex.id(), canvas, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            }
+
+            // Motion tracking: pick the point by clicking, and show the point and its path.
+            if let Some(sel) = self.selected.and_then(|id| self.project.clip(id)).cloned() {
+                if let Some(m) = self.project.media(sel.media_id).filter(|m| m.kind == MediaKind::Video && sel.title.is_none()).cloned() {
+                    let (src, cv) = ((m.width.max(1), m.height.max(1)), (self.project.width, self.project.height));
+                    if self.track_pick {
+                        let resp = ui.interact(canvas, egui::Id::new("track_pick"), Sense::click());
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                        if let (true, Some(p)) = (resp.clicked(), resp.interact_pointer_pos()) {
+                            let c = ((p.x - canvas.left()) / canvas.width(), (p.y - canvas.top()) / canvas.height());
+                            let pp = tracker::canvas_to_pic(c, src, cv);
+                            self.track_pt = (pp.0.clamp(0.0, 1.0), pp.1.clamp(0.0, 1.0));
+                            self.track_pick = false;
+                        }
+                    }
+                    let to_screen = |q: (f32, f32)| {
+                        let c = tracker::pic_to_canvas(q, src, cv);
+                        Pos2::new(canvas.left() + c.0 * canvas.width(), canvas.top() + c.1 * canvas.height())
+                    };
+                    if let Some(d) = self.track_data.as_ref().filter(|d| d.clip_id == sel.id) {
+                        let pts: Vec<Pos2> = d.pts.iter().map(|p| to_screen((p.x, p.y))).collect();
+                        if pts.len() > 1 {
+                            ui.painter().add(egui::Shape::line(pts, Stroke::new(1.5, Color32::from_rgb(255, 210, 80))));
+                        }
+                    }
+                    if self.track_pick || self.track_data.is_some() || self.track_pt != (0.5, 0.5) {
+                        let c = to_screen(self.track_pt);
+                        let st = Stroke::new(1.5, Color32::from_rgb(255, 80, 80));
+                        ui.painter().circle_stroke(c, 9.0, st);
+                        ui.painter().line_segment([c - Vec2::new(14.0, 0.0), c + Vec2::new(14.0, 0.0)], st);
+                        ui.painter().line_segment([c - Vec2::new(0.0, 14.0), c + Vec2::new(0.0, 14.0)], st);
+                    }
+                }
             }
 
             // Drag the selected title directly on the canvas. The box is an estimate of the text
@@ -2612,13 +2785,14 @@ fn effects_editor(ui: &mut egui::Ui, effects: &mut Vec<Effect>) {
             Effect::Sharpen { amount } => {
                 ui.add(egui::Slider::new(amount, -2.0..=5.0).text("Amount"));
             }
-            Effect::ChromaKey { color, similarity, blend } => {
+            Effect::ChromaKey { color, similarity, blend, spill } => {
                 ui.horizontal(|ui| {
                     ui.label("Color to remove");
                     ui.color_edit_button_srgb(color);
                 });
                 ui.add(egui::Slider::new(similarity, 0.01..=0.5).text("Similarity"));
                 ui.add(egui::Slider::new(blend, 0.0..=0.5).text("Edge blend"));
+                ui.add(egui::Slider::new(spill, 0.0..=1.0).text("Spill suppression"));
             }
             Effect::Zoom { from, to, fx, fy, ease } => {
                 ui.add(egui::Slider::new(from, 0.25..=4.0).suffix("x").text("Start zoom"));

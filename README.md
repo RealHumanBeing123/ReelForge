@@ -58,7 +58,10 @@ The finished program is in the following folder: `target\release\reelforge.exe`.
 - **Audio:** per-clip pan, 3-band equaliser, compressor, noise reduction, de-esser, reverb, echo and loudness normalisation (*Properties > Audio effects*), a gain readout in dB, fades, **crossfade into the next clip**, **waveforms** on audio clips, audio-level keyframes, a **loudness meter** (Tools; LUFS, range and true peak) and optional loudness normalisation to a LUFS target on export.
 - **Colour:** lift / gamma / gain, temperature and tint, **LUT import** (.cube, .3dl and more), HSL secondary grading by colour band, curve presets, and **video scopes** (U): waveform, RGB parade, vectorscope, histogram.
 - **Compositing and effects:** blend modes (multiply, screen, overlay and more), soft-edged rectangle / ellipse masks, glow, lens distortion, rotate, pixelate, film grain, denoise and stabilise (needs an FFmpeg build with vidstab). Keyframes have easing (linear, in, out, in-out, hold), and also cover audio level.
-- **Speed:** besides range speed, **speed ramps** (smooth acceleration across a range) and optional frame interpolation for smoother slow motion.
+- **Speed ramps:** besides range speed, ramp smoothly between two speeds across a range, with a choice of velocity curve (linear, smooth, fast start, slow start), plus optional frame interpolation for smoother slow motion.
+- **Chroma key** now has **spill suppression** to remove the green / blue tint left on edges and hair.
+- **Text and clip animation presets:** *Animation (keyframes) > Animation presets...* applies fade in, fade in and out, slide up, slide in from left, pop, zoom-out reveal, drop in or slow drift as ordinary keyframes you can then edit. Works on titles and any other clip.
+- **Motion tracking:** select a video clip, open *Motion tracking*, click *Pick on preview* and click the spot to follow, put the playhead where the spot is, then press *Track from playhead*. When it finishes (a yellow path shows on the preview), choose a title or another clip and press *Attach clip to track*: it is centred on the point with position keyframes that follow it. Tracking runs on low-resolution frames in the background (up to 60 s at a time), and tracks the raw picture, so it works best on high-contrast spots that stay visible and on clips without zoom or scale keyframes.
 - **Media management:**
   - **Bins:** give media a bin name (the *Bin* box under the search field) or right-click > *Move to bin*. The list groups by bin, and a bin collapses when you click its heading. Search matches name, tag or bin.
   - **Details:** select an item to see its path, resolution, frame rate, bitrate, file size, codecs and modified date.
@@ -124,7 +127,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 
 <img width="359" height="444" alt="RF5" src="https://github.com/user-attachments/assets/274e9e59-f387-49c3-8f2f-402ad50d3832" />
 
-## Known limitations (v0.6)
+## Known limitations (v0.7)
 
 - **This code has not been compiled or run on Windows by its author.** The FFmpeg commands it generates (export, preview, titles, recordings) were tested against FFmpeg 6.1 on Linux with synthetic inputs; the egui interface and the Windows capture devices (`gdigrab`, DirectShow) have not. Expect to fix a few compile errors on the first build.
 - Screen and voice recording use FFmpeg's `gdigrab` and DirectShow, so they work on Windows only. System-audio capture needs a loopback device such as "Stereo Mix", which many PCs have disabled by default.
@@ -134,7 +137,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 - The unsaved-changes prompt covers closing the program only. File > New and File > Open replace the current project without asking. Undoing back to the saved state still counts as changed.
 - **Speed / reverse / freeze:** changing a clip's length ripples later clips on the *same track only*. Audio on another track is not moved, so a sped-up video with separate voice-over can drift out of sync; keep them on one track or retime both. Reverse buffers every frame of the clip in memory, so use it on short clips (a few seconds to a minute, less at 4K), and the paused preview of a long reversed clip can be slow. Freeze frames are silent. Images and titles cannot be sped up (their length is set directly).
 - **Zoom** uses the first Zoom effect on a clip. Zooming in past 1x crops the picture; zooming out below 1x or moving the focus to an edge can reveal black background. The zoom is applied after other effects, and combines (multiplies) with scale keyframes.
-- **Not included:** multicam editing, planar / motion tracking, particle systems, 3D compositing and camera solve, optical-flow retiming beyond FFmpeg's interpolation, RAW camera formats, XML / AAF round-trips, DCP / IMF, watch folders, render farms and project collaboration. These are large features that FFmpeg cannot supply on its own.
+- **Not included:** multicam editing, planar tracking (single-point tracking is included), particle systems, 3D compositing and camera solve, optical-flow retiming beyond FFmpeg's interpolation, RAW camera formats, XML / AAF round-trips, DCP / IMF, watch folders, render farms and project collaboration. These are large features that FFmpeg cannot supply on its own.
 - Shuttle playback keyframes and subtitles keep their normal timing, so they appear slightly off while playing at other than 1x. Audio is sped up with the picture.
 - Proxies are for preview only. Loudness measurement and range export use the originals.
 - Keyframe times are relative to the clip start. Trimming a clip's left edge does not shift them. Splitting a clip keeps animation continuous.

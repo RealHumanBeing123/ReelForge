@@ -285,7 +285,7 @@ pub enum ProxyMsg {
 
 /// Deferred edits requested from inside the properties panel (which cannot touch the project).
 pub enum ExtAction {
-    Ramp { id: u64, a: f64, b: f64, s0: f64, s1: f64 },
+    Ramp { id: u64, a: f64, b: f64, s0: f64, s1: f64, curve: RampCurve },
     Crossfade(u64),
     Slip(u64, f64),
     Slide(u64, f64),
@@ -342,6 +342,7 @@ pub struct Ext {
     pub preset_name: String,
     pub ramp_s0: f64,
     pub ramp_s1: f64,
+    pub ramp_curve: RampCurve,
     pub action: Option<ExtAction>,
     pub rate: f64,
 }
@@ -394,6 +395,7 @@ impl Ext {
             preset_name: String::new(),
             ramp_s0: 1.0,
             ramp_s1: 4.0,
+            ramp_curve: RampCurve::Smooth,
             action: None,
             rate: 1.0,
         };
@@ -627,10 +629,10 @@ impl ReelForge {
         // deferred edits from the properties panel
         if let Some(a) = self.ext.action.take() {
             match a {
-                ExtAction::Ramp { id, a, b, s0, s1 } => {
+                ExtAction::Ramp { id, a, b, s0, s1, curve } => {
                     self.push_undo();
-                    if self.project.speed_ramp(id, a, b, s0, s1, 10) {
-                        self.status = "Speed ramp applied (10 steps).".into();
+                    if self.project.speed_ramp_ex(id, a, b, s0, s1, 12, curve) {
+                        self.status = "Speed ramp applied (12 steps).".into();
                     } else {
                         self.undo.pop();
                         self.status = "Pick a range at least 0.05 s long inside the clip.".into();

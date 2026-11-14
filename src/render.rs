@@ -377,8 +377,14 @@ fn effect_filter(e: &Effect, uid: &str) -> String {
         Effect::Vignette => "vignette=PI/4".to_string(),
         Effect::FlipH => "hflip".to_string(),
         Effect::FlipV => "vflip".to_string(),
-        Effect::ChromaKey { color, similarity, blend } => {
-            format!("chromakey=color={}:similarity={similarity:.3}:blend={blend:.3}", hex(*color))
+        Effect::ChromaKey { color, similarity, blend, spill } => {
+            let mut f = format!("chromakey=color={}:similarity={similarity:.3}:blend={blend:.3}", hex(*color));
+            if *spill > 0.01 {
+                // despill the key colour's dominant channel (green unless the key is blue)
+                let kind = if color[2] > color[1] { "blue" } else { "green" };
+                f.push_str(&format!(",despill=type={kind}:mix={:.2}:expand=0", spill.clamp(0.0, 1.0)));
+            }
+            f
         }
         // Zoom is applied through the layer's dynamic scale and overlay position, not a filter.
         Effect::Zoom { .. } => String::new(),
