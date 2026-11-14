@@ -93,6 +93,7 @@ Both recorders offer the same encoding options as Export: container, resolution,
 MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV hardware encoders; AAC, MP3, Opus, Vorbis, FLAC, PCM. Resolutions 480p to 2160p (4K), frame rate, video bitrate (or constant quality), audio bitrate, encoder speed, size estimate, progress bar, cancel.
 
 - **Export presets:** pick YouTube 1080p / 4K, Instagram / TikTok, X / Twitter, Vimeo, small file, Web (WebM VP9), Broadcast (1080p25, -23 LUFS) or Archive (ProRes). A preset sets format, size, frame rate, codec, bitrate and loudness target. Use **Save as preset** to keep your own (stored in `%APPDATA%\ReelForge\config.json`). For vertical platforms, set the canvas to 9:16 first.
+- **Render time estimate:** while exporting you see the elapsed time and an estimate of the time left. When it finishes, ReelForge reports how long it took and remembers how fast your PC rendered. The next time you open the Export window it shows an estimated render time scaled to the chosen resolution, frame rate and length. It is a guide only: codec, effects and hardware encoders change real speed.
 - **Batch export:** tick several presets, choose a folder and press *Export*. ReelForge renders them one after another, named `<project>_<preset>.<ext>`, with a "file 2 of 5" progress label. Cancelling or an error stops the rest of the queue.
 
 ## Shortcuts

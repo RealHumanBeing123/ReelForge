@@ -232,6 +232,9 @@ pub struct Config {
     pub fx_presets: Vec<FxPreset>,
     #[serde(default)]
     pub export_presets: Vec<crate::render::ExportPreset>,
+    /// Measured render speed (output pixels x frames per second) from the last export.
+    #[serde(default)]
+    pub render_rate: f64,
     #[serde(default = "yes")]
     pub show_media: bool,
     #[serde(default = "yes")]
@@ -244,7 +247,7 @@ fn yes() -> bool {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], export_presets: vec![], show_media: true, show_props: true }
+        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], export_presets: vec![], render_rate: 0.0, show_media: true, show_props: true }
     }
 }
 

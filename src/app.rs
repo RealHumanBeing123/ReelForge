@@ -153,6 +153,9 @@ pub struct ReelForge {
     render_rx: Option<Receiver<RenderMsg>>,
     render_cancel: Arc<AtomicBool>,
     render_progress: f32,
+    render_started: Option<Instant>,
+    /// Output pixels x frames in the current render (for speed estimates).
+    render_work: f64,
     render_msg: String,
 
     ffmpeg_ok: bool,
@@ -246,6 +249,8 @@ impl ReelForge {
             render_rx: None,
             render_cancel: Arc::new(AtomicBool::new(false)),
             render_progress: 0.0,
+            render_started: None,
+            render_work: 0.0,
             render_msg: String::new(),
             ffmpeg_ok,
             status: if ffmpeg_ok {
@@ -649,8 +654,18 @@ impl ReelForge {
                 match m {
                     RenderMsg::Progress(p) => self.render_progress = p,
                     RenderMsg::Done => {
-                        self.render_msg = "Export finished.".into();
-                        self.status = "Export finished.".into();
+                        let took = self.render_started.take().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+                        let mut msg = "Export finished.".to_string();
+                        if took > 0.5 {
+                            msg = format!("Export finished in {}.", fmt_span(took));
+                            if self.render_work > 0.0 {
+                                // remember how fast this PC renders, to estimate the next export
+                                self.ext.cfg.render_rate = self.render_work / took;
+                                self.ext.save_cfg();
+                            }
+                        }
+                        self.render_msg = msg.clone();
+                        self.status = msg;
                         finished = true;
                     }
                     RenderMsg::Cancelled => {
@@ -693,6 +708,9 @@ impl ReelForge {
             (Some(a), Some(b)) if settings.use_range && (b - a).abs() > 0.05 => self.project.range(a.min(b), a.max(b)),
             _ => self.project.clone(),
         };
+        let (ow, oh) = self.project.output_size(settings.short_side);
+        self.render_work = ow as f64 * oh as f64 * settings.fps.max(1) as f64 * to_render.duration();
+        self.render_started = Some(Instant::now());
         let (rx, c) = render::start(ctx.clone(), to_render, settings);
         self.render_rx = Some(rx);
         self.render_cancel = c;
@@ -2485,6 +2503,12 @@ impl ReelForge {
                     ui.label(format!("Batch: file {} of {}", self.batch_total - self.batch.len(), self.batch_total));
                 }
                 ui.add(egui::ProgressBar::new(self.render_progress).show_percentage().animate(true));
+                if let Some(t0) = self.render_started {
+                    let el = t0.elapsed().as_secs_f64();
+                    let p = self.render_progress as f64;
+                    let left = if p > 0.02 { format!("about {} left", fmt_span(el * (1.0 - p) / p)) } else { "estimating...".to_string() };
+                    ui.label(format!("Elapsed {}  -  {}", fmt_span(el), left));
+                }
                 if ui.button("Cancel export").clicked() {
                     cancel = true;
                 }
@@ -2492,6 +2516,19 @@ impl ReelForge {
                 if !self.render_msg.is_empty() {
                     ui.label(&self.render_msg);
                     ui.add_space(6.0);
+                }
+                let rate = self.ext.cfg.render_rate;
+                if rate > 0.0 && dur > 0.0 {
+                    let len = match (self.project.mark_in, self.project.mark_out) {
+                        (Some(a), Some(b)) if self.settings.use_range && (b - a).abs() > 0.05 => (b - a).abs(),
+                        _ => dur,
+                    };
+                    let est = ow as f64 * oh as f64 * self.settings.fps.max(1) as f64 * len / rate;
+                    ui.label(egui::RichText::new(format!("Estimated render time: about {} (from your last export; varies with codec and effects)", fmt_span(est))).weak());
+                    ui.add_space(4.0);
+                } else if dur > 0.0 {
+                    ui.label(egui::RichText::new("Estimated render time appears after your first export.").weak());
+                    ui.add_space(4.0);
                 }
                 let ready = self.settings.output.is_some() && dur > 0.0 && self.ffmpeg_ok;
                 ui.horizontal(|ui| {
@@ -2952,6 +2989,18 @@ fn anim_editor(ui: &mut egui::Ui, anim: &mut Anim, rel_t: f64, dur: f64) {
         });
     }
     ui.label(egui::RichText::new("Move the playhead over the clip, then add a keyframe and set its value. Values blend linearly between keyframes.").weak().size(11.0));
+}
+
+/// "45 s", "3 min 05 s", "1 h 02 min".
+fn fmt_span(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min {:02} s", s / 60, s % 60)
+    } else {
+        format!("{} h {:02} min", s / 3600, (s / 60) % 60)
+    }
 }
 
 fn elide(s: &str, max: usize) -> String {
