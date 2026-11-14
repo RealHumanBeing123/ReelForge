@@ -59,7 +59,14 @@ The finished program is in the following folder: `target\release\reelforge.exe`.
 - **Colour:** lift / gamma / gain, temperature and tint, **LUT import** (.cube, .3dl and more), HSL secondary grading by colour band, curve presets, and **video scopes** (U): waveform, RGB parade, vectorscope, histogram.
 - **Compositing and effects:** blend modes (multiply, screen, overlay and more), soft-edged rectangle / ellipse masks, glow, lens distortion, rotate, pixelate, film grain, denoise and stabilise (needs an FFmpeg build with vidstab). Keyframes have easing (linear, in, out, in-out, hold), and also cover audio level.
 - **Speed:** besides range speed, **speed ramps** (smooth acceleration across a range) and optional frame interpolation for smoother slow motion.
-- **Media management:** search the bin by name, tag or bin, tag media, **proxy files** for smooth preview (Tools > Generate proxies; View > Use proxies; export always uses the originals), and relink missing media.
+- **Media management:**
+  - **Bins:** give media a bin name (the *Bin* box under the search field) or right-click > *Move to bin*. The list groups by bin, and a bin collapses when you click its heading. Search matches name, tag or bin.
+  - **Details:** select an item to see its path, resolution, frame rate, bitrate, file size, codecs and modified date.
+  - **LUT on import:** the `...` menu next to *+ Import* has *Import with LUT...*, and right-click > *Set automatic LUT...* works on existing media. New clips made from that media get the LUT effect automatically.
+  - **Proxy files** for smooth preview (Tools > Generate proxies; View > Use proxies; export always uses the originals), and relink for missing media.
+  - **Check and back up:** *Tools > Check media files* flags missing or changed files. *Back up and verify media...* copies every file into a folder and compares each copy byte for byte, writing `backup_log.csv`.
+  - **Ingest log:** every import is recorded in the project (name, path, type, duration, size, time). *Tools > Export ingest log (CSV)...* saves it.
+  - **Effect presets:** save a clip's effect stack by name and add it to any clip from *Effects > Effect presets...* (stored in `%APPDATA%\ReelForge\config.json`).
 - **Interchange and subtitles:** export a CMX3600 **EDL**; import / edit / export **SRT subtitles**, burned into the picture on export and/or written as a sidecar .srt.
 - **Customisation:** every command has a **rebindable shortcut** (Tools > Keyboard shortcuts), **macros** record and replay command sequences, and *View > Workspaces* (Editing, Color, Audio, Timeline focus) show or hide panels and scopes. Settings are saved in `%APPDATA%\ReelForge\config.json`.
 

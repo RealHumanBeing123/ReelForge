@@ -131,6 +131,8 @@ pub struct ReelForge {
     rec_add_to_timeline: bool,
     rec_minimize: bool,
     pending_add: Option<PathBuf>,
+    pending_lut: HashMap<PathBuf, String>,
+    bin_collapsed: std::collections::HashSet<String>,
 
     export_open: bool,
     settings: RenderSettings,
@@ -218,6 +220,8 @@ impl ReelForge {
             rec_add_to_timeline: true,
             rec_minimize: true,
             pending_add: None,
+            pending_lut: HashMap::new(),
+            bin_collapsed: Default::default(),
             export_open: false,
             settings: RenderSettings::default(),
             render_rx: None,
@@ -350,6 +354,7 @@ impl ReelForge {
                 tag: String::new(),
                 bin: String::new(),
                 proxy: None,
+                info: Default::default(),
             });
         }
         if c.freeze {
@@ -415,6 +420,17 @@ impl ReelForge {
             .pick_files()
         {
             for f in files {
+                self.import_path(ctx, f);
+            }
+        }
+    }
+
+    /// Pick a LUT, then media: clips made from these files get the LUT automatically.
+    fn import_with_lut(&mut self, ctx: &egui::Context) {
+        let Some(lut) = rfd::FileDialog::new().set_title("Choose a LUT").add_filter("3D LUT", &["cube", "3dl", "dat", "m3d", "csp"]).pick_file() else { return };
+        if let Some(files) = rfd::FileDialog::new().set_title("Choose media to import with this LUT").add_filter("All media", MEDIA_EXTS).pick_files() {
+            for f in files {
+                self.pending_lut.insert(f.clone(), lut.to_string_lossy().into_owned());
                 self.import_path(ctx, f);
             }
         }
@@ -504,6 +520,20 @@ impl ReelForge {
                 Ok(mut m) => {
                     m.id = self.project.alloc_id();
                     self.status = format!("Imported {}", m.name);
+                    if let Some(lut) = self.pending_lut.remove(&m.path) {
+                        if m.kind != MediaKind::Audio {
+                            m.info.lut = lut;
+                        }
+                    }
+                    let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    self.project.ingest.push(IngestEntry {
+                        when,
+                        name: m.name.clone(),
+                        path: m.path.to_string_lossy().into_owned(),
+                        kind: format!("{:?}", m.kind).to_lowercase(),
+                        duration: m.duration,
+                        size_bytes: m.info.size_bytes,
+                    });
                     self.request_thumb(ctx, &m);
                     let add_now = self.pending_add.as_ref() == Some(&m.path);
                     let new_id = m.id;
@@ -831,6 +861,12 @@ impl ReelForge {
             ui.horizontal(|ui| {
                 ui.heading("Media");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("...", |ui| {
+                        if ui.button("Import with LUT...").clicked() {
+                            self.import_with_lut(ctx);
+                            ui.close_menu();
+                        }
+                    });
                     if ui.button("+ Import").clicked() {
                         self.import_dialog(ctx);
                     }
@@ -872,8 +908,73 @@ impl ReelForge {
                     }
                 }
             }
+            if let Some(m) = self.selected_media.and_then(|id| self.project.media.iter().find(|m| m.id == id)).cloned() {
+                egui::CollapsingHeader::new("Details").id_salt("mediainfo").default_open(false).show(ui, |ui| {
+                    egui::Grid::new("mediainfo_grid").num_columns(2).show(ui, |ui| {
+                        let mut row = |k: &str, v: String| {
+                            ui.label(egui::RichText::new(k).weak());
+                            ui.label(v);
+                            ui.end_row();
+                        };
+                        row("File", m.path.to_string_lossy().into_owned());
+                        if m.kind != MediaKind::Audio {
+                            row("Size", format!("{} x {}", m.width, m.height));
+                        }
+                        if m.kind == MediaKind::Video && m.info.fps > 0.0 {
+                            row("Frame rate", format!("{:.2} fps", m.info.fps));
+                        }
+                        row("Duration", fmt_time(m.duration));
+                        row("Codecs", format!("{} {}", m.video_codec, m.audio_codec).trim().to_string());
+                        if m.info.bitrate_kbps > 0 {
+                            row("Bitrate", format!("{} kb/s", m.info.bitrate_kbps));
+                        }
+                        row("File size", format!("{:.1} MB", m.info.size_bytes as f64 / 1_048_576.0));
+                        if m.info.modified > 0 {
+                            row("Modified", crate::interchange::iso_utc(m.info.modified));
+                        }
+                        if !m.info.lut.is_empty() {
+                            row("Auto LUT", m.info.lut.clone());
+                        }
+                        if self.ext.is_missing(m.id) {
+                            row("Status", "MISSING - use Tools > Relink".to_string());
+                        }
+                    });
+                });
+            }
+            let mut move_to: Option<(u64, String)> = None;
+            let mut set_lut: Option<u64> = None;
+            let mut clear_lut: Option<u64> = None;
+            let bins: Vec<String> = {
+                let mut b: Vec<String> = self.project.media.iter().filter(|m| !m.bin.is_empty()).map(|m| m.bin.clone()).collect();
+                b.sort();
+                b.dedup();
+                b
+            };
+            let mut items = items;
+            items.sort_by(|a, b| a.bin.to_lowercase().cmp(&b.bin.to_lowercase()).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+            let mut last_bin: Option<String> = None;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for m in &items {
+                    // bin (folder) headers; click to collapse
+                    if last_bin.as_ref() != Some(&m.bin) {
+                        last_bin = Some(m.bin.clone());
+                        if !m.bin.is_empty() || bins.len() > 0 {
+                            let collapsed = self.bin_collapsed.contains(&m.bin);
+                            let count = items.iter().filter(|x| x.bin == m.bin).count();
+                            let title = if m.bin.is_empty() { "Unsorted".to_string() } else { m.bin.clone() };
+                            let label = format!("{} {} ({})", if collapsed { "▸" } else { "▾" }, title, count);
+                            if ui.add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click())).clicked() {
+                                if collapsed {
+                                    self.bin_collapsed.remove(&m.bin);
+                                } else {
+                                    self.bin_collapsed.insert(m.bin.clone());
+                                }
+                            }
+                        }
+                    }
+                    if self.bin_collapsed.contains(&m.bin) {
+                        continue;
+                    }
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), Sense::click_and_drag());
                     let selected = self.selected_media == Some(m.id);
                     let bg = if selected {
@@ -923,6 +1024,28 @@ impl ReelForge {
                             add = Some(m.id);
                             ui.close_menu();
                         }
+                        ui.menu_button("Move to bin", |ui| {
+                            if ui.button("(no bin)").clicked() {
+                                move_to = Some((m.id, String::new()));
+                                ui.close_menu();
+                            }
+                            for b in &bins {
+                                if ui.button(b).clicked() {
+                                    move_to = Some((m.id, b.clone()));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        if m.kind != MediaKind::Audio {
+                            if ui.button("Set automatic LUT...").clicked() {
+                                set_lut = Some(m.id);
+                                ui.close_menu();
+                            }
+                            if !m.info.lut.is_empty() && ui.button("Clear automatic LUT").clicked() {
+                                clear_lut = Some(m.id);
+                                ui.close_menu();
+                            }
+                        }
                         if ui.button("Remove from project").clicked() {
                             remove = Some(m.id);
                             ui.close_menu();
@@ -933,6 +1056,27 @@ impl ReelForge {
             });
             if let Some(id) = add {
                 self.add_selected_media_to_timeline(id);
+            }
+            if let Some((id, bin)) = move_to {
+                if let Some(m) = self.project.media.iter_mut().find(|m| m.id == id) {
+                    m.bin = bin;
+                    self.revision += 1;
+                }
+            }
+            if let Some(id) = set_lut {
+                if let Some(p) = rfd::FileDialog::new().add_filter("3D LUT", &["cube", "3dl", "dat", "m3d", "csp"]).pick_file() {
+                    if let Some(m) = self.project.media.iter_mut().find(|m| m.id == id) {
+                        m.info.lut = p.to_string_lossy().into_owned();
+                        self.revision += 1;
+                        self.status = "New clips made from this media will get the LUT. Existing clips are unchanged.".into();
+                    }
+                }
+            }
+            if let Some(id) = clear_lut {
+                if let Some(m) = self.project.media.iter_mut().find(|m| m.id == id) {
+                    m.info.lut.clear();
+                    self.revision += 1;
+                }
             }
             if let Some(id) = remove {
                 self.push_undo();
@@ -956,6 +1100,8 @@ impl ReelForge {
                     let (mut do_split, mut do_delete, mut do_freeze) = (false, false, false);
                     let mut do_range: Option<(f64, f64, f64)> = None;
                     let mut pending: Option<ext::ExtAction> = None;
+                    let mut save_fx = false;
+                    let fx_presets: Vec<ext::FxPreset> = self.ext.cfg.fx_presets.clone();
                     let fr = 1.0 / self.project.fps.max(1) as f64;
                     let next_id = self.project.clips.iter().find(|n| n.track == orig.track && n.id != orig.id && (n.start - orig.end()).abs() < 1e-3).map(|n| n.id);
                     let (ramp_s0, ramp_s1) = (&mut self.ext.ramp_s0, &mut self.ext.ramp_s1);
@@ -1104,6 +1250,33 @@ impl ReelForge {
                             });
                             egui::CollapsingHeader::new(format!("Effects ({})", c.effects.len())).id_salt("fx").default_open(true).show(ui, |ui| {
                                 effects_editor(ui, &mut c.effects);
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("fxpreset").selected_text("Effect presets...").show_ui(ui, |ui| {
+                                        for p in &fx_presets {
+                                            if ui.button(&p.name).on_hover_text("Adds this preset's effects to the clip").clicked() {
+                                                c.effects.extend(p.effects.iter().cloned());
+                                                ui.close_menu();
+                                            }
+                                        }
+                                        if fx_presets.is_empty() {
+                                            ui.label(egui::RichText::new("None saved yet").weak());
+                                        }
+                                    });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut self.ext.fx_name).hint_text("preset name").desired_width(100.0));
+                                    if ui.add_enabled(!self.ext.fx_name.trim().is_empty() && !c.effects.is_empty(), egui::Button::new("Save stack")).clicked() {
+                                        let name = self.ext.fx_name.trim().to_string();
+                                        self.ext.cfg.fx_presets.retain(|p| p.name != name);
+                                        self.ext.cfg.fx_presets.push(ext::FxPreset { name, effects: c.effects.clone() });
+                                        save_fx = true;
+                                    }
+                                    if !fx_presets.is_empty() && ui.small_button("Delete all").clicked() {
+                                        self.ext.cfg.fx_presets.clear();
+                                        save_fx = true;
+                                    }
+                                });
                             });
                             egui::CollapsingHeader::new("Animation (keyframes)").default_open(true).show(ui, |ui| {
                                 anim_editor(ui, &mut c.anim, playhead_rel, c.duration);
@@ -1116,6 +1289,9 @@ impl ReelForge {
                         });
                     });
                     self.commit_clip_edit(&orig, c);
+                    if save_fx {
+                        self.ext.save_cfg();
+                    }
                     if pending.is_some() {
                         self.ext.action = pending;
                     }

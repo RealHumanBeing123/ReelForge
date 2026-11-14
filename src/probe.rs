@@ -1,4 +1,4 @@
-use crate::model::{MediaItem, MediaKind, IMAGE_DEFAULT_SECS};
+use crate::model::{MediaInfo, MediaItem, MediaKind, IMAGE_DEFAULT_SECS};
 use crate::util::command;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
@@ -70,5 +70,27 @@ pub fn probe(path: &Path) -> Result<MediaItem> {
         tag: String::new(),
         bin: String::new(),
         proxy: None,
+        info: MediaInfo {
+            size_bytes: v["format"]["size"].as_str().and_then(|x| x.parse().ok()).or_else(|| std::fs::metadata(path).ok().map(|m| m.len())).unwrap_or(0),
+            fps: video.and_then(|s| s["avg_frame_rate"].as_str()).map(parse_rate).unwrap_or(0.0),
+            bitrate_kbps: v["format"]["bit_rate"].as_str().and_then(|x| x.parse::<u64>().ok()).map(|b| (b / 1000) as u32).unwrap_or(0),
+            modified: std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+            lut: String::new(),
+        },
     })
+}
+
+/// "30000/1001" -> 29.97
+fn parse_rate(s: &str) -> f64 {
+    match s.split_once('/') {
+        Some((a, b)) => {
+            let (a, b): (f64, f64) = (a.parse().unwrap_or(0.0), b.parse().unwrap_or(0.0));
+            if b > 0.0 {
+                a / b
+            } else {
+                0.0
+            }
+        }
+        None => s.parse().unwrap_or(0.0),
+    }
 }

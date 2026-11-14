@@ -32,6 +32,32 @@ pub struct MediaItem {
     /// Lightweight proxy file used for preview when proxies are on.
     #[serde(default)]
     pub proxy: Option<PathBuf>,
+    /// File details recorded at import.
+    #[serde(default)]
+    pub info: MediaInfo,
+}
+
+/// Details of the source file, recorded when it is imported.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
+pub struct MediaInfo {
+    pub size_bytes: u64,
+    pub fps: f64,
+    pub bitrate_kbps: u32,
+    /// File modification time, seconds since the Unix epoch.
+    pub modified: u64,
+    /// LUT applied automatically to clips made from this media (empty = none).
+    pub lut: String,
+}
+
+/// One line of the ingest log: what was imported, and when.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct IngestEntry {
+    pub when: u64,
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub duration: f64,
+    pub size_bytes: u64,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -768,6 +794,9 @@ pub struct Project {
     /// Use proxy files (where they exist) for preview and playback. Export always uses originals.
     #[serde(default)]
     pub use_proxies: bool,
+    /// Every file imported into this project.
+    #[serde(default)]
+    pub ingest: Vec<IngestEntry>,
 }
 
 impl Default for Project {
@@ -787,6 +816,7 @@ impl Default for Project {
             mark_out: None,
             subtitles: vec![],
             use_proxies: false,
+            ingest: vec![],
         }
     }
 }
@@ -903,8 +933,18 @@ impl Project {
         let track = track.min(self.tracks.len().saturating_sub(1));
         let start = self.nearest_free(track, start, dur, None);
         let id = self.alloc_id();
-        self.clips.push(Clip::new(id, media_id, track, start, 0.0, dur));
+        self.push_media_clip(Clip::new(id, media_id, track, start, 0.0, dur));
         Some(id)
+    }
+
+    /// Add a clip made from media, applying the media's default LUT (if it has one).
+    fn push_media_clip(&mut self, mut c: Clip) {
+        if let Some(m) = self.media(c.media_id) {
+            if !m.info.lut.is_empty() && m.kind != MediaKind::Audio {
+                c.effects.push(Effect::Lut { path: m.info.lut.clone() });
+            }
+        }
+        self.clips.push(c);
     }
 
     pub fn add_title(&mut self, track: usize, start: f64, spec: TitleSpec) -> u64 {
@@ -1264,7 +1304,7 @@ impl Project {
         }
         self.shift_after(track, t - 0.05, dur, None);
         let id = self.alloc_id();
-        self.clips.push(Clip::new(id, media_id, track, t, 0.0, dur));
+        self.push_media_clip(Clip::new(id, media_id, track, t, 0.0, dur));
         Some(id)
     }
 
@@ -1275,7 +1315,7 @@ impl Project {
         let t = t.max(0.0);
         self.cut_range(t, t + dur, false, Some(track));
         let id = self.alloc_id();
-        self.clips.push(Clip::new(id, media_id, track, t, 0.0, dur));
+        self.push_media_clip(Clip::new(id, media_id, track, t, 0.0, dur));
         Some(id)
     }
 
@@ -1293,11 +1333,11 @@ impl Project {
         } else {
             let t2 = self.nearest_free(track, t, dur, None);
             let id = self.alloc_id();
-            self.clips.push(Clip::new(id, media_id, track, t2, a, dur));
+            self.push_media_clip(Clip::new(id, media_id, track, t2, a, dur));
             return Some(id);
         }
         let id = self.alloc_id();
-        self.clips.push(Clip::new(id, media_id, track, t, a, dur));
+        self.push_media_clip(Clip::new(id, media_id, track, t, a, dur));
         Some(id)
     }
 

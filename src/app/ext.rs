@@ -335,6 +335,9 @@ pub struct Ext {
     wave_requested: HashSet<u64>,
 
     pub search: String,
+    missing: HashSet<u64>,
+    backup_rx: Option<Receiver<String>>,
+    pub fx_name: String,
     pub bin_filter: String,
     pub preset_name: String,
     pub ramp_s0: f64,
@@ -384,6 +387,9 @@ impl Ext {
             waves: HashMap::new(),
             wave_requested: HashSet::new(),
             search: String::new(),
+            missing: HashSet::new(),
+            backup_rx: None,
+            fx_name: String::new(),
             bin_filter: String::new(),
             preset_name: String::new(),
             ramp_s0: 1.0,
@@ -410,6 +416,10 @@ impl Ext {
 
     pub fn shortcut_of(&self, cmd: Cmd) -> Shortcut {
         self.bindings.iter().find(|(c, _)| *c == cmd).map(|(_, s)| *s).unwrap_or_else(|| cmd.default_shortcut())
+    }
+
+    pub fn is_missing(&self, id: u64) -> bool {
+        self.missing.contains(&id)
     }
 
     pub fn save_cfg(&self) {
@@ -669,6 +679,17 @@ impl ReelForge {
                 self.ext.loud_rx = None;
             }
         }
+        // backup progress
+        if let Some(rx) = &self.ext.backup_rx {
+            let mut done = false;
+            while let Ok(m) = rx.try_recv() {
+                done = m.starts_with("Backup finished") || m.starts_with("Backup failed");
+                self.status = m;
+            }
+            if done {
+                self.ext.backup_rx = None;
+            }
+        }
         // proxies
         while let Ok(m) = self.ext.proxy_rx.try_recv() {
             self.ext.proxy_busy = self.ext.proxy_busy.saturating_sub(1);
@@ -795,6 +816,18 @@ impl ReelForge {
                 self.relink_selected();
                 ui.close_menu();
             }
+            if ui.button("Check media files (missing / changed)").clicked() {
+                self.check_media();
+                ui.close_menu();
+            }
+            if ui.button("Back up and verify media...").clicked() {
+                self.backup_media(ctx);
+                ui.close_menu();
+            }
+            if ui.button("Export ingest log (CSV)...").clicked() {
+                self.export_ingest();
+                ui.close_menu();
+            }
             ui.separator();
             if ui.button("Export EDL (CMX3600)...").clicked() {
                 self.export_edl();
@@ -881,6 +914,88 @@ impl ReelForge {
                 Err(e) => format!("Could not write file: {e}"),
             };
         }
+    }
+
+    /// Flag media whose file is gone or whose size no longer matches what was imported.
+    fn check_media(&mut self) {
+        self.ext.missing.clear();
+        let (mut gone, mut changed) = (0, 0);
+        for m in &self.project.media {
+            match std::fs::metadata(&m.path) {
+                Err(_) => {
+                    self.ext.missing.insert(m.id);
+                    gone += 1;
+                }
+                Ok(md) if m.info.size_bytes > 0 && md.len() != m.info.size_bytes => changed += 1,
+                Ok(_) => {}
+            }
+        }
+        self.status = if gone == 0 && changed == 0 {
+            "All media files are present and unchanged.".into()
+        } else {
+            format!("{gone} media file(s) missing (select one and use Tools > Relink), {changed} changed since import.")
+        };
+    }
+
+    fn export_ingest(&mut self) {
+        if self.project.ingest.is_empty() {
+            self.status = "Nothing has been imported yet.".into();
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new().set_file_name("ingest_log.csv").add_filter("CSV", &["csv"]).save_file() {
+            self.status = match std::fs::write(&path, interchange::to_ingest_csv(&self.project)) {
+                Ok(_) => format!("Wrote {}", path.display()),
+                Err(e) => format!("Could not write the log: {e}"),
+            };
+        }
+    }
+
+    /// Copy every media file into a folder and verify each copy byte for byte; writes a log.
+    fn backup_media(&mut self, ctx: &egui::Context) {
+        if self.ext.backup_rx.is_some() {
+            return;
+        }
+        let Some(dir) = rfd::FileDialog::new().set_title("Choose a folder for the backup").pick_folder() else { return };
+        let files: Vec<(u64, PathBuf)> = self.project.media.iter().map(|m| (m.id, m.path.clone())).collect();
+        if files.is_empty() {
+            self.status = "There is no media to back up.".into();
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        self.status = format!("Backing up {} file(s)...", files.len());
+        self.ext.backup_rx = Some(rx);
+        std::thread::spawn(move || {
+            let send = |m: String| {
+                let _ = tx.send(m);
+                ctx2.request_repaint();
+            };
+            let mut log = String::from("file,status,bytes\n");
+            let (mut ok, mut bad) = (0usize, 0usize);
+            let total = files.len();
+            for (n, (id, src)) in files.into_iter().enumerate() {
+                let name = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("media{id}"));
+                let dst = dir.join(format!("{id}_{name}"));
+                send(format!("Backing up {}/{}: {name}", n + 1, total));
+                let status = match std::fs::copy(&src, &dst) {
+                    Err(e) => format!("COPY FAILED ({e})"),
+                    Ok(_) => match same_bytes(&src, &dst) {
+                        Ok(true) => "OK".to_string(),
+                        Ok(false) => "MISMATCH".to_string(),
+                        Err(e) => format!("VERIFY FAILED ({e})"),
+                    },
+                };
+                if status == "OK" {
+                    ok += 1;
+                } else {
+                    bad += 1;
+                }
+                let bytes = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+                log.push_str(&format!("\"{}\",{},{}\n", name.replace('"', "'"), status, bytes));
+            }
+            let _ = std::fs::write(dir.join("backup_log.csv"), log);
+            send(if bad == 0 { format!("Backup finished: {ok} file(s) copied and verified.") } else { format!("Backup finished with problems: {ok} verified, {bad} failed (see backup_log.csv).") });
+        });
     }
 
     fn relink_selected(&mut self) {
@@ -1357,5 +1472,25 @@ impl ReelForge {
             self.start_loudness(ctx);
         }
         self.ext.loud_open = open;
+    }
+}
+
+/// True when two files have identical contents (streams both in 1 MiB chunks).
+fn same_bytes(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
     }
 }

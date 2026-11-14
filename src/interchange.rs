@@ -86,3 +86,32 @@ pub fn to_edl(project: &Project, title: &str) -> String {
     }
     out
 }
+
+/// UTC "YYYY-MM-DD HH:MM:SS" from Unix seconds.
+pub fn iso_utc(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // civil-from-days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", rem / 3600, (rem / 60) % 60, rem % 60)
+}
+
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// CSV of everything imported into the project.
+pub fn to_ingest_csv(project: &Project) -> String {
+    let mut out = String::from("imported_utc,name,type,duration_s,size_bytes,path\n");
+    for e in &project.ingest {
+        out.push_str(&format!("{},{},{},{:.3},{},{}\n", iso_utc(e.when), csv_field(&e.name), e.kind, e.duration, e.size_bytes, csv_field(&e.path)));
+    }
+    out
+}
