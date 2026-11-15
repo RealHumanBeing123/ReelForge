@@ -1726,6 +1726,109 @@ impl ReelForge {
         self.ext.mc_open = open;
     }
 
+    fn win_planar(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.ext.pl_rx {
+            if let Ok(r) = rx.try_recv() {
+                self.ext.pl_rx = None;
+                match r {
+                    Ok(d) => {
+                        self.ext.pl_msg = format!("Tracked {} samples per corner. Select the clip to pin and press Attach.", d.2[0].len());
+                        self.ext.pl_data = Some(d);
+                    }
+                    Err(e) => self.ext.pl_msg = e,
+                }
+            }
+        }
+        if !self.ext.pl_open {
+            self.ext.pl_pick = None;
+            return;
+        }
+        let mut open = true;
+        let (mut track, mut attach) = (false, false);
+        let src_sel = self.selected.and_then(|id| self.project.clip(id)).cloned();
+        egui::Window::new("Planar track (corner pin)").open(&mut open).default_width(380.0).show(ctx, |ui| {
+            ui.label(egui::RichText::new("Select the footage clip, mark the four corners of the surface (a screen, a sign) on the preview, and track. Then select the clip that should be pinned there and press Attach.").weak().small());
+            ui.separator();
+            for (i, name) in ["Top-left", "Top-right", "Bottom-right", "Bottom-left"].iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(*name);
+                    ui.add(egui::DragValue::new(&mut self.ext.pl_pts[i].0).speed(0.002).range(0.0..=1.0).fixed_decimals(3).prefix("x "));
+                    ui.add(egui::DragValue::new(&mut self.ext.pl_pts[i].1).speed(0.002).range(0.0..=1.0).fixed_decimals(3).prefix("y "));
+                    if ui.selectable_label(self.ext.pl_pick == Some(i), "Pick on preview").clicked() {
+                        self.ext.pl_pick = if self.ext.pl_pick == Some(i) { None } else { Some(i) };
+                    }
+                });
+            }
+            ui.separator();
+            let busy = self.ext.pl_rx.is_some();
+            ui.horizontal(|ui| {
+                let ok = src_sel.as_ref().map_or(false, |c| !c.generated() && !c.reverse && !c.freeze);
+                if ui.add_enabled(ok && !busy, egui::Button::new("Track from playhead")).clicked() {
+                    track = true;
+                }
+                if busy {
+                    ui.spinner();
+                }
+                if ui.add_enabled(self.ext.pl_data.is_some() && src_sel.is_some(), egui::Button::new("Attach to selected clip")).clicked() {
+                    attach = true;
+                }
+            });
+            if !self.ext.pl_msg.is_empty() {
+                ui.label(&self.ext.pl_msg);
+            }
+            ui.label(egui::RichText::new("Each corner is followed on its own (template matching), so this works best on flat, well-lit, textured surfaces and may drift if a corner is hidden or blurred.").weak().small());
+        });
+        if track {
+            if let Some(c) = src_sel {
+                if let Some(m) = self.project.media(c.media_id).cloned() {
+                    let t0 = (self.playhead - c.start).clamp(0.0, (c.duration - 0.2).max(0.0));
+                    let from = c.in_point + t0 * c.speed;
+                    let secs = (c.duration - t0) * c.speed;
+                    let (tx, rx) = channel();
+                    let (path, pts, id, ctx2) = (m.path.clone(), self.ext.pl_pts, c.id, ctx.clone());
+                    std::thread::spawn(move || {
+                        let r = crate::tracker::track_corners(&path, from, secs, m.width, m.height, pts).map(|p| (id, t0, p));
+                        let _ = tx.send(r);
+                        ctx2.request_repaint();
+                    });
+                    self.ext.pl_rx = Some(rx);
+                    self.ext.pl_data = None;
+                    self.ext.pl_msg = "Tracking four corners...".into();
+                }
+            }
+        }
+        if attach {
+            self.attach_planar();
+        }
+        self.ext.pl_open = open;
+    }
+
+    fn attach_planar(&mut self) {
+        let Some((src_id, t0, tracks)) = self.ext.pl_data.clone() else { return };
+        let (Some(src), Some(tid)) = (self.project.clip(src_id).cloned(), self.selected) else { return };
+        let Some(m) = self.project.media(src.media_id).cloned() else { return };
+        let Some(tgt) = self.project.clip(tid).cloned() else { return };
+        if tid == src_id {
+            self.ext.pl_msg = "Select the clip you want to pin (not the footage).".into();
+            return;
+        }
+        let t_offset = (src.start + t0) - tgt.start;
+        let keys = crate::tracker::to_pin_keys(&tracks, (m.width, m.height), (self.project.width, self.project.height), t_offset, src.speed, tgt.duration);
+        if keys.len() < 2 {
+            self.ext.pl_msg = "The tracked footage and the selected clip do not overlap in time.".into();
+            return;
+        }
+        self.push_undo();
+        let first = keys[0].pts;
+        if let Some(c) = self.project.clip_mut(tid) {
+            c.effects.retain(|e| !matches!(e, Effect::CornerPin { .. }));
+            c.effects.push(Effect::CornerPin { pts: first, track: keys });
+        }
+        self.revision += 1;
+        self.preview_dirty = true;
+        self.ext.pl_msg = "Attached: the clip is pinned to the tracked surface (Effects > Corner pin).".into();
+    }
+
     fn win_loudness(&mut self, ctx: &egui::Context) {
         if !self.ext.loud_open {
             return;

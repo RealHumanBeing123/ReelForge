@@ -34,8 +34,8 @@ enum RecKind {
     Voice,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 /// Result of a point-tracking run, kept until it is attached to another clip.
+#[derive(Clone)]
 struct TrackData {
     clip_id: u64,
     /// Seconds into the clip where tracking began.
@@ -43,6 +43,7 @@ struct TrackData {
     pts: Vec<TrackPoint>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum GridMode {
     Export,
     Screen,
@@ -1609,7 +1610,7 @@ impl ReelForge {
                     }
                     if self.ext.pl_open {
                         let quad: Vec<Pos2> = self.ext.pl_pts.iter().map(|p| to_screen(*p)).collect();
-                        let st = Stroke::new(1.5, Color32::from_rgb(90, 220, 255));
+                        let st = Stroke::new(1.5_f32, Color32::from_rgb(90, 220, 255));
                         for k in 0..4 {
                             ui.painter().line_segment([quad[k], quad[(k + 1) % 4]], st);
                             ui.painter().circle_filled(quad[k], 4.0, Color32::from_rgb(90, 220, 255));
@@ -1618,12 +1619,12 @@ impl ReelForge {
                     if let Some(d) = self.track_data.as_ref().filter(|d| d.clip_id == sel.id) {
                         let pts: Vec<Pos2> = d.pts.iter().map(|p| to_screen((p.x, p.y))).collect();
                         if pts.len() > 1 {
-                            ui.painter().add(egui::Shape::line(pts, Stroke::new(1.5, Color32::from_rgb(255, 210, 80))));
+                            ui.painter().add(egui::Shape::line(pts, Stroke::new(1.5_f32, Color32::from_rgb(255, 210, 80))));
                         }
                     }
                     if self.track_pick || self.track_data.is_some() || self.track_pt != (0.5, 0.5) {
                         let c = to_screen(self.track_pt);
-                        let st = Stroke::new(1.5, Color32::from_rgb(255, 80, 80));
+                        let st = Stroke::new(1.5_f32, Color32::from_rgb(255, 80, 80));
                         ui.painter().circle_stroke(c, 9.0, st);
                         ui.painter().line_segment([c - Vec2::new(14.0, 0.0), c + Vec2::new(14.0, 0.0)], st);
                         ui.painter().line_segment([c - Vec2::new(0.0, 14.0), c + Vec2::new(0.0, 14.0)], st);
@@ -1665,7 +1666,7 @@ impl ReelForge {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
                 }
                 let col = if resp.dragged() { Color32::from_rgb(255, 215, 90) } else { Color32::from_white_alpha(170) };
-                ui.painter().rect_stroke(r, 2.0, Stroke::new(1.5, col));
+                ui.painter().rect_stroke(r, 2.0, Stroke::new(1.5_f32, col));
                 // corner handle: drag to resize the box about its centre
                 let handle = Rect::from_center_size(r.right_bottom(), Vec2::splat(12.0));
                 let hresp = ui.interact(handle, egui::Id::new("title_resize"), Sense::drag());
@@ -1831,7 +1832,7 @@ impl ReelForge {
         p.rect_filled(thumb.shrink2(Vec2::new(0.0, 1.0)), 4.0, col);
         // playhead position marker
         let px = bar.left() as f64 + (self.playhead / total) * track_w;
-        p.line_segment([Pos2::new(px as f32, bar.top()), Pos2::new(px as f32, bar.bottom())], Stroke::new(1.5, Color32::from_rgb(255, 90, 80)));
+        p.line_segment([Pos2::new(px as f32, bar.top()), Pos2::new(px as f32, bar.bottom())], Stroke::new(1.5_f32, Color32::from_rgb(255, 90, 80)));
     }
 
     fn timeline_body(&mut self, ui: &mut egui::Ui) {
@@ -2106,7 +2107,7 @@ impl ReelForge {
         let px = tx(self.playhead, scroll);
         if px >= lane_left && px <= rect.right() {
             let col = Color32::from_rgb(235, 70, 70);
-            painter.line_segment([Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())], Stroke::new(1.5, col));
+            painter.line_segment([Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())], Stroke::new(1.5_f32, col));
             painter.add(egui::Shape::convex_polygon(
                 vec![Pos2::new(px - 6.0, rect.top()), Pos2::new(px + 6.0, rect.top()), Pos2::new(px, rect.top() + 10.0)],
                 col,
