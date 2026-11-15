@@ -15,6 +15,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod collab;
 mod ext;
 
 const TRACK_H: f32 = 54.0;
@@ -50,11 +51,11 @@ enum GridMode {
 
 const MEDIA_EXTS: &[&str] = &[
     // video
-    "mp4", "m4v", "mov", "mkv", "avi", "wmv", "webm", "flv", "mpg", "mpeg", "ts", "mts", "m2ts", "3gp", "ogv", "gif",
+    "mp4", "m4v", "mov", "mkv", "avi", "wmv", "webm", "flv", "mpg", "mpeg", "ts", "mts", "m2ts", "3gp", "ogv", "gif", "mxf", "dv", "vob",
     // audio
     "mp3", "wav", "flac", "aac", "m4a", "ogg", "oga", "opus", "wma", "aiff", "aif",
     // images
-    "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff",
+    "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr", "dpx", "dng", "tga", "jp2",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -109,6 +110,7 @@ pub struct ReelForge {
     last_req_time: f64,
     edit_stamp: Option<(u64, Instant)>,
     ext: ext::Ext,
+    collab: collab::Collab,
     track_pick: bool,
     track_pt: (f32, f32),
     track_rx: Option<Receiver<Result<(u64, f64, Vec<TrackPoint>), String>>>,
@@ -208,6 +210,7 @@ impl ReelForge {
             last_req_time: -1.0,
             edit_stamp: None,
             ext: ext::Ext::load(),
+            collab: collab::Collab::new(),
             track_pick: false,
             track_pt: (0.5, 0.5),
             track_rx: None,
@@ -328,7 +331,7 @@ impl ReelForge {
     /// Insert a freeze frame of the clip under the playhead (selected clip first).
     fn freeze_at_playhead(&mut self) {
         let t = self.playhead;
-        let ok = |c: &&Clip| c.title.is_none() && !c.freeze && t >= c.start && t <= c.end();
+        let ok = |c: &&Clip| !c.generated() && !c.freeze && t >= c.start && t <= c.end();
         let target = self
             .selected
             .and_then(|id| self.project.clip(id))
@@ -429,6 +432,24 @@ impl ReelForge {
                 info: Default::default(),
             });
         }
+        if let Some(p) = &c.particles {
+            return Some(MediaItem {
+                id: 0,
+                path: PathBuf::new(),
+                name: format!("Particles: {}", p.kind.label()),
+                kind: MediaKind::Image,
+                duration: c.duration,
+                width: 0,
+                height: 0,
+                has_audio: false,
+                video_codec: String::new(),
+                audio_codec: String::new(),
+                tag: String::new(),
+                bin: String::new(),
+                proxy: None,
+                info: Default::default(),
+            });
+        }
         if c.freeze {
             // Image-like (any length) but keeps the source id so the timeline shows its thumbnail.
             let mut m = self.project.media(c.media_id).cloned()?;
@@ -445,6 +466,13 @@ impl ReelForge {
         self.push_undo();
         let top = self.project.tracks.len().saturating_sub(1);
         let id = self.project.add_title(top, self.playhead, TitleSpec::default());
+        self.selected = Some(id);
+    }
+
+    fn add_particles_at_playhead(&mut self, kind: ParticleKind) {
+        self.push_undo();
+        let top = self.project.tracks.len().saturating_sub(1);
+        let id = self.project.add_particles(top, self.playhead, ParticleSpec::new(kind));
         self.selected = Some(id);
     }
 
@@ -534,11 +562,17 @@ impl ReelForge {
             self.project_path.clone()
         };
         if let Some(p) = path {
-            match serde_json::to_string_pretty(&self.project).map_err(|e| e.to_string()).and_then(|s| std::fs::write(&p, s).map_err(|e| e.to_string())) {
+            let (target, conflict) = if self.project_path.as_ref() == Some(&p) { self.collab_save_target(&p) } else { (p.clone(), false) };
+            match serde_json::to_string_pretty(&self.project).map_err(|e| e.to_string()).and_then(|s| std::fs::write(&target, s).map_err(|e| e.to_string())) {
                 Ok(()) => {
-                    self.status = format!("Saved {}", p.display());
-                    self.project_path = Some(p);
+                    if conflict {
+                        self.status = format!("Someone else changed {} since you opened it, so your changes were saved as {} instead. Nothing was overwritten.", p.display(), target.display());
+                    } else {
+                        self.status = format!("Saved {}", p.display());
+                        self.project_path = Some(p.clone());
+                    }
                     self.saved_revision = self.revision;
+                    self.collab_saved(&p, conflict);
                     saved = true;
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
@@ -553,7 +587,7 @@ impl ReelForge {
             Ok(proj) => {
                 self.new_project();
                 self.project = proj;
-                self.project_path = Some(p);
+                self.project_path = Some(p.clone());
                 let items = self.project.media.clone();
                 let mut missing = 0;
                 for m in &items {
@@ -564,6 +598,7 @@ impl ReelForge {
                     }
                 }
                 self.status = if missing > 0 { format!("Opened project ({missing} media file(s) missing)") } else { "Project opened".into() };
+                self.collab_opened(&p);
             }
             Err(e) => self.status = format!("Could not open project: {e}"),
         }
@@ -924,6 +959,14 @@ impl ReelForge {
                         self.add_title_at_playhead();
                         ui.close_menu();
                     }
+                    ui.menu_button("Add particles at playhead", |ui| {
+                        for k in ParticleKind::ALL {
+                            if ui.button(k.label()).clicked() {
+                                self.add_particles_at_playhead(k);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     if ui.button("Add track").clicked() {
                         self.push_undo();
                         self.project.add_track();
@@ -1220,7 +1263,7 @@ impl ReelForge {
                             ui.label(fmt_time(c.start));
                             ui.end_row();
                             ui.label("Duration");
-                            let free_len = c.freeze || c.title.is_some() || media.as_ref().map_or(false, |m| m.kind == MediaKind::Image);
+                            let free_len = c.freeze || c.generated() || media.as_ref().map_or(false, |m| m.kind == MediaKind::Image);
                             if free_len {
                                 ui.add(egui::DragValue::new(&mut c.duration).speed(0.05).range(MIN_CLIP..=3600.0).suffix(" s"));
                             } else {
@@ -1247,9 +1290,13 @@ impl ReelForge {
                             ui.add_space(8.0);
                             egui::CollapsingHeader::new("Title").default_open(true).show(ui, |ui| title_editor(ui, t));
                         }
+                        if let Some(p) = c.particles.as_mut() {
+                            ui.add_space(8.0);
+                            egui::CollapsingHeader::new("Particles").default_open(true).show(ui, |ui| particle_editor(ui, p));
+                        }
                         let is_audio = media.as_ref().map_or(false, |m| m.kind == MediaKind::Audio);
-                        let is_video = media.as_ref().map_or(false, |m| m.kind == MediaKind::Video) && c.title.is_none() && !c.freeze;
-                        if is_video || (is_audio && c.title.is_none()) {
+                        let is_video = media.as_ref().map_or(false, |m| m.kind == MediaKind::Video) && !c.generated() && !c.freeze;
+                        if is_video || (is_audio && !c.generated()) {
                             egui::CollapsingHeader::new("Speed & direction").id_salt("speed").default_open(true).show(ui, |ui| {
                                 let mut sp = c.speed;
                                 if ui.add(egui::Slider::new(&mut sp, 0.1..=16.0).logarithmic(true).suffix("x").text("Speed")).changed() {
@@ -1325,7 +1372,7 @@ impl ReelForge {
                         if c.freeze {
                             ui.label(egui::RichText::new("Freeze frame: drag the clip's edges or set Duration to change how long it holds.").weak().small());
                         }
-                        if c.title.is_none() && !c.freeze {
+                        if !c.generated() && !c.freeze {
                             egui::CollapsingHeader::new("Edit tools").id_salt("edittools").default_open(false).show(ui, |ui| {
                                 let mut nudge = |ui: &mut egui::Ui, label: &str, hint: &str, mk: &dyn Fn(f64) -> Option<ext::ExtAction>, pending: &mut Option<ext::ExtAction>| {
                                     ui.horizontal(|ui| {
@@ -1347,7 +1394,7 @@ impl ReelForge {
                                 }
                             });
                         }
-                        if !is_audio && c.title.is_none() {
+                        if !is_audio && !c.generated() {
                             egui::ComboBox::from_label("Blend mode").selected_text(c.blend.label()).show_ui(ui, |ui| {
                                 for b in BlendMode::ALL {
                                     ui.selectable_value(&mut c.blend, b, b.label());
@@ -1534,7 +1581,7 @@ impl ReelForge {
 
             // Motion tracking: pick the point by clicking, and show the point and its path.
             if let Some(sel) = self.selected.and_then(|id| self.project.clip(id)).cloned() {
-                if let Some(m) = self.project.media(sel.media_id).filter(|m| m.kind == MediaKind::Video && sel.title.is_none()).cloned() {
+                if let Some(m) = self.project.media(sel.media_id).filter(|m| m.kind == MediaKind::Video && !sel.generated()).cloned() {
                     let (src, cv) = ((m.width.max(1), m.height.max(1)), (self.project.width, self.project.height));
                     if self.track_pick {
                         let resp = ui.interact(canvas, egui::Id::new("track_pick"), Sense::click());
@@ -1550,6 +1597,24 @@ impl ReelForge {
                         let c = tracker::pic_to_canvas(q, src, cv);
                         Pos2::new(canvas.left() + c.0 * canvas.width(), canvas.top() + c.1 * canvas.height())
                     };
+                    if let Some(i) = self.ext.pl_pick {
+                        let resp = ui.interact(canvas, egui::Id::new("planar_pick"), Sense::click());
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                        if let (true, Some(p)) = (resp.clicked(), resp.interact_pointer_pos()) {
+                            let c = ((p.x - canvas.left()) / canvas.width(), (p.y - canvas.top()) / canvas.height());
+                            let pp = tracker::canvas_to_pic(c, src, cv);
+                            self.ext.pl_pts[i] = (pp.0.clamp(0.0, 1.0), pp.1.clamp(0.0, 1.0));
+                            self.ext.pl_pick = if i < 3 { Some(i + 1) } else { None };
+                        }
+                    }
+                    if self.ext.pl_open {
+                        let quad: Vec<Pos2> = self.ext.pl_pts.iter().map(|p| to_screen(*p)).collect();
+                        let st = Stroke::new(1.5, Color32::from_rgb(90, 220, 255));
+                        for k in 0..4 {
+                            ui.painter().line_segment([quad[k], quad[(k + 1) % 4]], st);
+                            ui.painter().circle_filled(quad[k], 4.0, Color32::from_rgb(90, 220, 255));
+                        }
+                    }
                     if let Some(d) = self.track_data.as_ref().filter(|d| d.clip_id == sel.id) {
                         let pts: Vec<Pos2> = d.pts.iter().map(|p| to_screen((p.x, p.y))).collect();
                         if pts.len() > 1 {
@@ -1909,7 +1974,9 @@ impl ReelForge {
             }
             let Some(m) = self.media_for(c) else { continue };
             let sel = self.selected == Some(c.id);
-            let base = if c.title.is_some() {
+            let base = if c.particles.is_some() {
+                Color32::from_rgb(60, 150, 160)
+            } else if c.title.is_some() {
                 Color32::from_rgb(120, 85, 175)
             } else {
                 match m.kind {
@@ -2740,6 +2807,28 @@ fn settings_grid(ui: &mut egui::Ui, s: &mut RenderSettings, mode: GridMode, dims
     });
 }
 
+fn particle_editor(ui: &mut egui::Ui, p: &mut ParticleSpec) {
+    egui::ComboBox::from_label("Type").selected_text(p.kind.label()).show_ui(ui, |ui| {
+        for k in ParticleKind::ALL {
+            if ui.selectable_value(&mut p.kind, k, k.label()).clicked() {
+                *p = ParticleSpec { seed: p.seed, ..ParticleSpec::new(k) };
+            }
+        }
+    });
+    ui.add(egui::Slider::new(&mut p.count, 10..=500).text("Amount"));
+    ui.add(egui::Slider::new(&mut p.speed, 0.0..=4.0).text("Speed"));
+    ui.add(egui::Slider::new(&mut p.size, 0.3..=4.0).text("Size"));
+    ui.horizontal(|ui| {
+        ui.label("Seed");
+        ui.add(egui::DragValue::new(&mut p.seed).range(0..=9999));
+        if p.kind != ParticleKind::Confetti {
+            ui.label("Colour");
+            ui.color_edit_button_srgb(&mut p.color);
+        }
+    });
+    ui.label(egui::RichText::new("Rendered at reduced resolution and scaled up; soft particles hide this. Blend modes (Screen/Add) work well for sparks and fireflies.").weak().small());
+}
+
 fn title_editor(ui: &mut egui::Ui, t: &mut TitleSpec) {
     ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(3).desired_width(f32::INFINITY));
     ui.add_space(4.0);
@@ -2907,6 +2996,30 @@ fn effects_editor(ui: &mut egui::Ui, effects: &mut Vec<Effect>) {
                 ui.add(egui::Slider::new(h, 0.05..=1.0).text("Height"));
                 ui.add(egui::Slider::new(feather, 0.0..=0.5).text("Feather"));
                 ui.checkbox(invert, "Invert mask");
+            }
+            Effect::Transform3D { rx, ry, rz, persp } => {
+                ui.add(egui::Slider::new(rx, -80.0..=80.0).suffix(" deg").text("Tilt (X)"));
+                ui.add(egui::Slider::new(ry, -80.0..=80.0).suffix(" deg").text("Turn (Y)"));
+                ui.add(egui::Slider::new(rz, -180.0..=180.0).suffix(" deg").text("Roll (Z)"));
+                ui.add(egui::Slider::new(persp, 0.0..=1.0).text("Perspective"));
+                ui.label(egui::RichText::new("The layer is flattened onto a turned plane (not a real 3D scene). Combine with Position/Scale keyframes for fly-ins.").weak().small());
+            }
+            Effect::CornerPin { pts, track } => {
+                for (i, name) in ["Top-left", "Top-right", "Bottom-right", "Bottom-left"].iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(*name);
+                        ui.add(egui::DragValue::new(&mut pts[i][0]).speed(0.002).range(-0.5..=1.5).fixed_decimals(3).prefix("x "));
+                        ui.add(egui::DragValue::new(&mut pts[i][1]).speed(0.002).range(-0.5..=1.5).fixed_decimals(3).prefix("y "));
+                    });
+                }
+                if track.is_empty() {
+                    ui.label(egui::RichText::new("Fixed corners. Use Tools > Planar track to make them follow footage.").weak().small());
+                } else {
+                    ui.label(format!("Following a planar track ({} keys).", track.len()));
+                    if ui.small_button("Clear track").clicked() {
+                        track.clear();
+                    }
+                }
             }
             _ => {}
         }

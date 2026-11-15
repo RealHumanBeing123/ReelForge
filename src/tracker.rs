@@ -3,7 +3,7 @@
 //! FFmpeg decodes grey frames; each new frame is searched around the last position for the patch
 //! that best matches (lowest sum of absolute differences) the patch seen in the previous frame.
 //! No UI or egui dependencies.
-use crate::model::{Ease, Keyframe};
+use crate::model::{Ease, Keyframe, PinKey};
 use crate::util::command;
 use std::io::Read;
 use std::path::Path;
@@ -176,4 +176,44 @@ pub fn to_keyframes(points: &[TrackPoint], src: (u32, u32), canvas: (u32, u32), 
         }
     }
     (kx, ky)
+}
+
+/// Track four corners (TL, TR, BR, BL; 0..1 of the picture) one after the other.
+pub fn track_corners(path: &Path, from: f64, secs: f64, src_w: u32, src_h: u32, corners: [(f32, f32); 4]) -> Result<[Vec<TrackPoint>; 4], String> {
+    let mut out: [Vec<TrackPoint>; 4] = Default::default();
+    for (i, c) in corners.iter().enumerate() {
+        out[i] = track_point(path, from, secs, src_w, src_h, *c)?;
+    }
+    Ok(out)
+}
+
+/// Corner-pin keys from four tracked corners (canvas fractions). Same timing rules as
+/// `to_keyframes`; the first key is held back to the start of the target clip.
+pub fn to_pin_keys(tracks: &[Vec<TrackPoint>; 4], src: (u32, u32), canvas: (u32, u32), t_offset: f64, speed: f64, target_len: f64) -> Vec<PinKey> {
+    let n = tracks.iter().map(|t| t.len()).min().unwrap_or(0);
+    let mut keys: Vec<PinKey> = vec![];
+    let mut last_t = f64::NEG_INFINITY;
+    for i in 0..n {
+        let t = tracks[0][i].dt / speed.max(0.01) + t_offset;
+        if t < 0.0 || t > target_len + 1e-6 || (t - last_t < 0.15 && i + 1 != n) {
+            continue;
+        }
+        last_t = t;
+        let mut pts = [[0.0f32; 2]; 4];
+        for c in 0..4 {
+            // light 3-point smoothing against pixel jitter
+            let (a, b) = (i.saturating_sub(1), (i + 1).min(n - 1));
+            let cnt = (b - a + 1) as f32;
+            let (sx, sy) = tracks[c][a..=b].iter().fold((0.0, 0.0), |s, p| (s.0 + p.x, s.1 + p.y));
+            let q = pic_to_canvas((sx / cnt, sy / cnt), src, canvas);
+            pts[c] = [q.0, q.1];
+        }
+        keys.push(PinKey { t, pts });
+    }
+    if let Some(f) = keys.first().cloned() {
+        if f.t > 0.01 {
+            keys.insert(0, PinKey { t: 0.0, pts: f.pts });
+        }
+    }
+    keys
 }

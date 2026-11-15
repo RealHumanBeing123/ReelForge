@@ -3,12 +3,14 @@
 mod app;
 mod interchange;
 mod model;
+mod particles;
 mod playback;
 mod preview;
 mod probe;
 mod record;
 mod render;
 mod scopes;
+mod sync;
 mod tracker;
 mod util;
 

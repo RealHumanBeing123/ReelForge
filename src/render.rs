@@ -1,5 +1,5 @@
 use crate::interchange;
-use crate::model::{AudioFx, BlendMode, Clip, Effect, Keyframe, MediaKind, Project, TitlePos, TitleSpec, Transition, TransitionKind};
+use crate::model::{AudioFx, BlendMode, Clip, Ease, Effect, Keyframe, MediaKind, PinKey, Project, TitlePos, TitleSpec, Transition, TransitionKind};
 use crate::util::command;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -364,6 +364,46 @@ fn hex(c: [u8; 3]) -> String {
     format!("0x{:02X}{:02X}{:02X}", c[0], c[1], c[2])
 }
 
+/// `perspective` filter that maps the frame's corners to `pts` (static, or moving with `track`).
+/// Make the outermost pixels transparent so `perspective` (which repeats edge pixels outside the
+/// warped quad) leaves the area around the quad transparent.
+const CLEAR_EDGES: &str = "drawbox=x=0:y=0:w=iw:h=2:color=black@0:t=fill:replace=1,drawbox=x=0:y=ih-2:w=iw:h=2:color=black@0:t=fill:replace=1,drawbox=x=0:y=0:w=2:h=ih:color=black@0:t=fill:replace=1,drawbox=x=iw-2:y=0:w=2:h=ih:color=black@0:t=fill:replace=1";
+
+fn corner_pin_filter(pts: &[[f32; 2]; 4], track: &[PinKey], rw: u32, rh: u32, fps: u32, offset: f64) -> String {
+    let mut parts = vec!["format=yuva420p".to_string(), CLEAR_EDGES.to_string()];
+    let mut opts = String::new();
+    let animated = track.len() >= 2;
+    // thin a long track to at most 40 keys to keep the filter expression short
+    let keys: Vec<&PinKey> = if animated {
+        let step = (track.len() as f64 / 40.0).ceil().max(1.0) as usize;
+        let mut k: Vec<&PinKey> = track.iter().step_by(step).collect();
+        if let (Some(last), Some(l2)) = (track.last(), k.last()) {
+            if l2.t != last.t {
+                k.push(last);
+            }
+        }
+        k
+    } else {
+        vec![]
+    };
+    let var = format!("(in/{fps}+{offset:.4})");
+    // perspective wants TL, TR, BL, BR; our corners are TL, TR, BR, BL
+    for (n, i) in [0usize, 1, 3, 2].into_iter().enumerate() {
+        for (axis, dim) in [(0usize, rw), (1usize, rh)] {
+            let expr = if animated {
+                let kfs: Vec<Keyframe> = keys.iter().map(|k| Keyframe { t: k.t, v: k.pts[i][axis] as f64, ease: Ease::Linear }).collect();
+                format!("{dim}*({})", kf_expr(&kfs, &var, 0.0))
+            } else {
+                format!("{:.2}", pts[i][axis] * dim as f32)
+            };
+            let name = format!("{}{}", if axis == 0 { "x" } else { "y" }, n);
+            opts.push_str(&format!("{name}='{expr}':"));
+        }
+    }
+    parts.push(format!("perspective={opts}sense=destination:interpolation=linear:eval={}", if animated { "frame" } else { "init" }));
+    parts.join(",")
+}
+
 fn effect_filter(e: &Effect, uid: &str) -> String {
     match e {
         Effect::ColorAdjust { brightness, contrast, saturation } => {
@@ -437,6 +477,17 @@ fn effect_filter(e: &Effect, uid: &str) -> String {
             let r = (strength.round() as i32).clamp(1, 64);
             format!("deshake=rx={r}:ry={r}:edge=mirror")
         }
+        Effect::Transform3D { rx, ry, rz, persp } => {
+            let p = crate::model::transform3d_corners(*rx, *ry, *rz, *persp);
+            let mut o = format!("format=yuva420p,{CLEAR_EDGES},perspective=");
+            // perspective wants TL, TR, BL, BR; ours are TL, TR, BR, BL
+            for (n, i) in [0usize, 1, 3, 2].into_iter().enumerate() {
+                o.push_str(&format!("x{n}=W*{:.5}:y{n}=H*{:.5}:", p[i][0], p[i][1]));
+            }
+            o.push_str("sense=destination:interpolation=linear");
+            o
+        }
+        Effect::CornerPin { .. } => String::new(),
         Effect::Mask { ellipse, cx, cy, w, h, feather, invert } => {
             let (rx, ry) = ((w / 2.0).max(0.01), (h / 2.0).max(0.01));
             let d = if *ellipse {
@@ -489,7 +540,15 @@ fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>,
             v.push("setsar=1".to_string());
         }
     }
+    if c.effects.iter().any(|e| matches!(e, Effect::CornerPin { .. })) {
+        // corner coordinates are canvas fractions: give the layer the canvas size first
+        v.push(format!("pad={rw}:{rh}:(ow-iw)/2:(oh-ih)/2:color=black@0.0"));
+    }
     for (k, e) in c.effects.iter().enumerate() {
+        if let Effect::CornerPin { pts, track } = e {
+            v.push(corner_pin_filter(pts, track, rw, rh, fps, c.anim_offset));
+            continue;
+        }
         let ef = effect_filter(e, &format!("{}_{k}", c.id));
         if !ef.is_empty() {
             v.push(ef);
@@ -502,7 +561,7 @@ fn layer_chain(c: &Clip, rw: u32, rh: u32, fps: u32, fit: bool) -> (Vec<String>,
     let tout = c.transition_out;
     let uses_fade = |t: &Transition| matches!(t.kind, TransitionKind::Fade | TransitionKind::Zoom);
     let keyed_alpha = !c.anim.opacity.is_empty();
-    let chroma = c.effects.iter().any(|e| matches!(e, Effect::ChromaKey { .. } | Effect::Mask { .. } | Effect::Rotate { .. }));
+    let chroma = c.effects.iter().any(|e| matches!(e, Effect::ChromaKey { .. } | Effect::Mask { .. } | Effect::Rotate { .. } | Effect::Transform3D { .. } | Effect::CornerPin { .. }));
     if uses_fade(&tin) || uses_fade(&tout) || keyed_alpha || chroma {
         v.push("format=yuva420p".to_string());
     }
@@ -810,6 +869,36 @@ pub fn build_graph_ex(project: &Project, rw: u32, rh: u32, fps: u32, video: bool
     let mut layer_no = 0usize;
     for c in clips {
         let Some(track) = project.tracks.get(c.track) else { continue };
+
+        // ---- generated particle clip: pre-rendered raw RGBA file at reduced resolution ----
+        if let Some(spec) = &c.particles {
+            if !video || track.hidden {
+                continue;
+            }
+            let (pw, ph) = crate::particles::raw_size(rw, rh);
+            let frames = ((c.duration * fps as f64).ceil() as u32).max(1);
+            let Some(path) = crate::particles::ensure_raw(spec, c.id, pw, ph, fps, c.anim_offset, frames) else { continue };
+            args.extend([
+                "-f".to_string(),
+                "rawvideo".to_string(),
+                "-pixel_format".to_string(),
+                "rgba".to_string(),
+                "-video_size".to_string(),
+                format!("{pw}x{ph}"),
+                "-framerate".to_string(),
+                fps.to_string(),
+                "-i".to_string(),
+                path.to_string_lossy().into_owned(),
+            ]);
+            let i = input_idx;
+            input_idx += 1;
+            let (chain, x, y) = layer_chain(c, rw, rh, fps, false);
+            layer_no += 1;
+            let lab = format!("p{layer_no}");
+            filters.push(format!("[{i}:v]scale={rw}:{rh}:flags=bilinear,setsar=1,format=rgba,{}[{lab}]", chain.join(",")));
+            current = composite(&mut filters, &current, &lab, &x, &y, c, layer_no, rw, rh, fps, total);
+            continue;
+        }
 
         // ---- generated title clip: no input file ----
         if let Some(spec) = &c.title {

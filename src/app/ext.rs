@@ -239,6 +239,14 @@ pub struct Config {
     pub show_media: bool,
     #[serde(default = "yes")]
     pub show_props: bool,
+    #[serde(default)]
+    pub watch_on: bool,
+    #[serde(default)]
+    pub watch_media: String,
+    #[serde(default)]
+    pub watch_render: String,
+    #[serde(default)]
+    pub watch_preset: String,
 }
 
 fn yes() -> bool {
@@ -247,7 +255,7 @@ fn yes() -> bool {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], export_presets: vec![], render_rate: 0.0, show_media: true, show_props: true }
+        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], export_presets: vec![], render_rate: 0.0, show_media: true, show_props: true, watch_on: false, watch_media: String::new(), watch_render: String::new(), watch_preset: String::new() }
     }
 }
 
@@ -348,7 +356,23 @@ pub struct Ext {
     pub ramp_curve: RampCurve,
     pub action: Option<ExtAction>,
     pub rate: f64,
+
+    pub mc_open: bool,
+    pub mc_angles: Vec<u64>,
+    pub mc_prog: Option<usize>,
+    mc_rx: Option<Receiver<Result<Vec<f64>, String>>>,
+    pub mc_msg: String,
+
+    pub pl_open: bool,
+    pub pl_pts: [(f32, f32); 4],
+    pub pl_pick: Option<usize>,
+    pl_rx: Option<Receiver<Result<PlanarData, String>>>,
+    pl_data: Option<PlanarData>,
+    pub pl_msg: String,
 }
+
+/// Result of tracking four corners: clip id, seconds into the clip tracking began, the four paths.
+type PlanarData = (u64, f64, [Vec<crate::tracker::TrackPoint>; 4]);
 
 impl Ext {
     pub fn load() -> Ext {
@@ -401,6 +425,17 @@ impl Ext {
             ramp_curve: RampCurve::Smooth,
             action: None,
             rate: 1.0,
+            mc_open: false,
+            mc_angles: vec![],
+            mc_prog: None,
+            mc_rx: None,
+            mc_msg: String::new(),
+            pl_open: false,
+            pl_pts: [(0.3, 0.3), (0.7, 0.3), (0.7, 0.7), (0.3, 0.7)],
+            pl_pick: None,
+            pl_rx: None,
+            pl_data: None,
+            pl_msg: String::new(),
         };
         e.rebuild_bindings();
         e
@@ -629,6 +664,7 @@ impl ReelForge {
     // ------------------------------------------------------------- polling background work
 
     pub(super) fn ext_poll(&mut self, ctx: &egui::Context) {
+        self.collab_poll(ctx);
         // deferred edits from the properties panel
         if let Some(a) = self.ext.action.take() {
             match a {
@@ -803,6 +839,23 @@ impl ReelForge {
             }
         });
         ui.menu_button("Tools", |ui| {
+            if ui.button("Planar track (corner pin)...").clicked() {
+                self.ext.pl_open = true;
+                ui.close_menu();
+            }
+            if ui.button("Version history...").clicked() {
+                self.collab.versions_open = true;
+                ui.close_menu();
+            }
+            if ui.button("Watch folders...").clicked() {
+                self.collab.watch_open = true;
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Multicam...").clicked() {
+                self.ext.mc_open = true;
+                ui.close_menu();
+            }
             if ui.button("Subtitles...").clicked() {
                 self.ext.subs_open = true;
                 ui.close_menu();
@@ -838,6 +891,19 @@ impl ReelForge {
                 self.export_edl();
                 ui.close_menu();
             }
+            if ui.button("Export Final Cut Pro 7 XML (Premiere / Resolve)...").clicked() {
+                self.export_xml(false);
+                ui.close_menu();
+            }
+            if ui.button("Export OpenTimelineIO (.otio)...").clicked() {
+                self.export_xml(true);
+                ui.close_menu();
+            }
+            if ui.button("Import Final Cut Pro 7 XML...").clicked() {
+                self.import_xml();
+                ui.close_menu();
+            }
+            ui.separator();
             if ui.button("Import subtitles (.srt)...").clicked() {
                 self.import_srt();
                 ui.close_menu();
@@ -887,6 +953,78 @@ impl ReelForge {
                 Err(e) => format!("Could not write EDL: {e}"),
             };
         }
+    }
+
+    fn export_xml(&mut self, otio: bool) {
+        let name = self.project_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+        let (ext, label) = if otio { ("otio", "OpenTimelineIO") } else { ("xml", "Final Cut Pro XML") };
+        if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{name}.{ext}")).add_filter(label, &[ext]).save_file() {
+            let text = if otio { interchange::to_otio(&self.project, &name) } else { interchange::to_xmeml(&self.project, &name) };
+            self.status = match std::fs::write(&path, text) {
+                Ok(_) => format!("Wrote {}", path.display()),
+                Err(e) => format!("Could not write file: {e}"),
+            };
+        }
+    }
+
+    /// Rebuild a timeline from an FCP7 XML file using media already imported into this project
+    /// (matched by file path, then by file name). Unmatched files are listed so they can be imported first.
+    fn import_xml(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Final Cut Pro XML", &["xml"]).pick_file() else { return };
+        let text = match std::fs::read(&path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => {
+                self.status = format!("Could not read file: {e}");
+                return;
+            }
+        };
+        let Some((_fps, clips)) = interchange::parse_xmeml(&text) else {
+            self.status = "That does not look like a Final Cut Pro 7 XML sequence.".into();
+            return;
+        };
+        let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+        let base = |s: &str| norm(s).rsplit('/').next().unwrap_or("").to_string();
+        let mut missing: Vec<String> = vec![];
+        let mut placed = 0;
+        self.push_undo();
+        let first_new_track = self.project.tracks.len();
+        let max_track = clips.iter().map(|c| c.track).max().unwrap_or(0);
+        for _ in 0..=max_track {
+            self.project.add_track();
+        }
+        for c in &clips {
+            let Some(m) = self.project.media.iter().find(|m| norm(&m.path.to_string_lossy()) == norm(&c.path)).or_else(|| self.project.media.iter().find(|m| base(&m.path.to_string_lossy()) == base(&c.path))).cloned() else {
+                if !missing.contains(&c.name) {
+                    missing.push(c.name.clone());
+                }
+                continue;
+            };
+            // linked audio of a video clip is already carried by the video clip
+            if c.audio && m.kind != MediaKind::Audio {
+                continue;
+            }
+            let tr = first_new_track + c.track;
+            let span = (c.out_pt - c.in_pt).max(0.05);
+            if let Some(id) = self.project.add_subclip(m.id, tr, c.start, c.in_pt, c.in_pt + span, true) {
+                if let Some(cl) = self.project.clip_mut(id) {
+                    if m.kind == MediaKind::Video && (c.speed.abs() - 1.0).abs() > 1e-6 && c.speed != 0.0 {
+                        cl.speed = c.speed.abs();
+                        cl.reverse = c.speed < 0.0;
+                        cl.duration = span / cl.speed;
+                    } else if c.speed < 0.0 {
+                        cl.reverse = true;
+                    }
+                }
+                placed += 1;
+            }
+        }
+        self.revision += 1;
+        self.preview_dirty = true;
+        self.status = if missing.is_empty() {
+            format!("Imported {placed} clips from {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        } else {
+            format!("Imported {placed} clips. Not in this project yet (import these files and run it again): {}", missing.join(", "))
+        };
     }
 
     fn import_srt(&mut self) {
@@ -1096,6 +1234,10 @@ impl ReelForge {
         self.win_subs(ctx);
         self.win_markers(ctx);
         self.win_loudness(ctx);
+        self.win_multicam(ctx);
+        self.win_planar(ctx);
+        self.win_versions(ctx);
+        self.win_watch(ctx);
     }
 
     fn win_shortcuts(&mut self, ctx: &egui::Context) {
@@ -1435,6 +1577,153 @@ impl ReelForge {
             self.playhead = t;
         }
         self.ext.markers_open = open;
+    }
+
+    /// Run audio sync for the angle clips on a worker thread; result = lag of each vs the first.
+    fn start_multicam_sync(&mut self, ctx: &egui::Context) {
+        let mut paths = vec![];
+        for id in &self.ext.mc_angles {
+            let p = self.project.clip(*id).and_then(|c| self.project.media(c.media_id)).map(|m| m.path.clone());
+            match p {
+                Some(p) => paths.push(p),
+                None => {
+                    self.ext.mc_msg = "An angle no longer exists.".into();
+                    return;
+                }
+            }
+        }
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let mut lags = vec![0.0];
+            let mut res = Ok(());
+            for p in paths.iter().skip(1) {
+                match crate::sync::media_offset(&paths[0], p) {
+                    Ok((lag, conf)) if conf >= 6.0 => lags.push(lag),
+                    Ok((_, conf)) => {
+                        res = Err(format!("Could not find a confident match for {} (score {conf:.1}). Do the cameras record the same sound?", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+                        break;
+                    }
+                    Err(e) => {
+                        res = Err(e);
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(res.map(|_| lags));
+            ctx2.request_repaint();
+        });
+        self.ext.mc_rx = Some(rx);
+        self.ext.mc_msg = "Analysing audio...".into();
+    }
+
+    fn win_multicam(&mut self, ctx: &egui::Context) {
+        if !self.ext.mc_open {
+            return;
+        }
+        if let Some(rx) = &self.ext.mc_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.ext.mc_rx = None;
+                    match res {
+                        Ok(lags) => {
+                            let angles = self.ext.mc_angles.clone();
+                            self.push_undo();
+                            if self.project.multicam_align(&angles, &lags) {
+                                self.ext.mc_msg = format!("Synced {} angles by sound.", angles.len());
+                            }
+                            self.revision += 1;
+                            self.preview_dirty = true;
+                        }
+                        Err(e) => self.ext.mc_msg = e,
+                    }
+                }
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
+        let mut open = true;
+        let (mut add_sel, mut clear, mut sync) = (false, false, false);
+        let mut cut: Option<u64> = None;
+        let busy = self.ext.mc_rx.is_some();
+        let angles = self.ext.mc_angles.clone();
+        let names: Vec<(u64, String)> = angles
+            .iter()
+            .map(|id| {
+                let n = self.project.clip(*id).and_then(|c| self.project.media(c.media_id)).map(|m| m.name.clone()).unwrap_or_else(|| "(missing)".into());
+                (*id, n)
+            })
+            .collect();
+        let has_sel = self.selected.is_some();
+        let msg = self.ext.mc_msg.clone();
+        egui::Window::new("Multicam").open(&mut open).default_width(340.0).show(ctx, |ui| {
+            ui.label(egui::RichText::new("Put each camera on its own track, select a clip, press Add. Sync lines the angles up by their sound; then switch angles at the playhead.").weak().small());
+            ui.horizontal(|ui| {
+                add_sel = ui.add_enabled(has_sel, egui::Button::new("Add selected clip as angle")).clicked();
+                clear = ui.button("Clear").clicked();
+            });
+            for (i, (id, n)) in names.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.monospace(format!("{}", i + 1));
+                    ui.label(n);
+                    if ui.small_button("Cut to this angle").clicked() {
+                        cut = Some(*id);
+                    }
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                sync = ui.add_enabled(!busy && angles.len() >= 2, egui::Button::new("Sync by audio")).clicked();
+                if busy {
+                    ui.spinner();
+                }
+            });
+            if !msg.is_empty() {
+                ui.label(&msg);
+            }
+        });
+        if clear {
+            self.ext.mc_angles.clear();
+            self.ext.mc_msg.clear();
+        }
+        if add_sel {
+            if let Some(id) = self.selected {
+                if !self.ext.mc_angles.contains(&id) && self.ext.mc_angles.len() < 9 {
+                    self.ext.mc_angles.push(id);
+                }
+            }
+        }
+        if sync {
+            self.start_multicam_sync(ctx);
+        }
+        if let Some(id) = cut {
+            let t = self.playhead;
+            let prog = match self.ext.mc_prog.filter(|p| *p < self.project.tracks.len()) {
+                Some(p) => p,
+                None => {
+                    self.project.add_track();
+                    let p = self.project.tracks.len() - 1;
+                    self.project.tracks[p].name = "Program".into();
+                    self.ext.mc_prog = Some(p);
+                    p
+                }
+            };
+            self.push_undo();
+            if self.project.multicam_cut(id, prog, t).is_some() {
+                for aid in self.ext.mc_angles.clone() {
+                    if let Some(tr) = self.project.clip(aid).map(|c| c.track) {
+                        if tr != prog {
+                            self.project.tracks[tr].muted = true;
+                        }
+                    }
+                }
+                self.ext.mc_msg = format!("Cut at {t:.2} s.");
+            } else {
+                self.ext.mc_msg = "Playhead is outside that angle, or the clip is retimed.".into();
+            }
+            self.revision += 1;
+            self.preview_dirty = true;
+        }
+        self.ext.mc_open = open;
     }
 
     fn win_loudness(&mut self, ctx: &egui::Context) {

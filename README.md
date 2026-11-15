@@ -73,6 +73,15 @@ The finished program is in the following folder: `target\release\reelforge.exe`.
 - **Interchange and subtitles:** export a CMX3600 **EDL**; import / edit / export **SRT subtitles**, burned into the picture on export and/or written as a sidecar .srt.
 - **Customisation:** every command has a **rebindable shortcut** (Tools > Keyboard shortcuts), **macros** record and replay command sequences, and *View > Workspaces* (Editing, Color, Audio, Timeline focus) show or hide panels and scopes. Settings are saved in `%APPDATA%\ReelForge\config.json`.
 
+### Advanced and large items (v0.8)
+- **Multicam** (*Tools > Multicam...*): put each camera on its own track, select a clip and press *Add selected clip as angle*. *Sync by audio* lines the angles up by their sound (FFT cross-correlation of the first 90 s; it refuses a match it is not confident about). *Cut to this angle* switches to that camera at the playhead on a "Program" track, like live switching; later cuts overwrite the remainder. The camera tracks are muted so the program carries the sound. Angle clips must be plain (not retimed).
+- **Particle generators** (*Effects*/add menu): snow, rain, sparks, confetti and fireflies as a clip you can drop on top of anything. Frames are computed from a seed so any frame renders on its own; they are drawn at reduced size and scaled up.
+- **3D rotate (perspective):** an effect with tilt (X), turn (Y), roll (Z) and perspective. It flattens the layer onto a turned plane; it is not a real 3D scene.
+- **Planar tracking / corner pin** (*Tools > Planar track (corner pin)...*): follow four corners with the point tracker and pin a layer onto a moving flat surface (screen replacement).
+- **Interchange:** export **Final Cut Pro 7 XML** (readable by Premiere Pro, DaVinci Resolve, Final Cut) and **OpenTimelineIO**; import clip positions back from FCP7 XML. EXR, DPX, DNG, TGA and JP2 are accepted as media where your FFmpeg build can decode them.
+- **Watch folders** (*Tools > Watch folders...*): new media dropped in a folder is imported automatically, and `.rforge` projects dropped in another are rendered with a chosen preset once the file has stopped changing. Works only while ReelForge is open.
+- **Project locking and version history:** opening a project writes a `<project>.lock` file naming who has it open; a second person is warned, and saving over a newer file on disk goes to a conflict copy instead of overwriting. *Tools > Version history...* saves named snapshots next to the project and restores them.
+
 ### Preview
 - Real-time playback with audio (Space).
 - **Preview quality selector** next to the transport controls: Draft 360p, Standard 540p, **High 720p (default)**, Full HD 1080p. Higher settings use Lanczos scaling and accurate colour conversion for a sharper picture. If playback stutters on a slower PC, drop to a lower setting. Export is not affected by this setting.
@@ -128,7 +137,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 
 <img width="359" height="444" alt="RF5" src="https://github.com/user-attachments/assets/274e9e59-f387-49c3-8f2f-402ad50d3832" />
 
-## Known limitations (v0.7)
+## Known limitations (v0.8)
 
 - **This code has not been compiled or run on Windows by its author.** The FFmpeg commands it generates (export, preview, titles, recordings) were tested against FFmpeg 6.1 on Linux with synthetic inputs; the egui interface and the Windows capture devices (`gdigrab`, DirectShow) have not. Expect to fix a few compile errors on the first build.
 - Screen and voice recording use FFmpeg's `gdigrab` and DirectShow, so they work on Windows only. System-audio capture needs a loopback device such as "Stereo Mix", which many PCs have disabled by default.
@@ -138,7 +147,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 - The unsaved-changes prompt covers closing the program only. File > New and File > Open replace the current project without asking. Undoing back to the saved state still counts as changed.
 - **Speed / reverse / freeze:** changing a clip's length ripples later clips on the *same track only*. Audio on another track is not moved, so a sped-up video with separate voice-over can drift out of sync; keep them on one track or retime both. Reverse buffers every frame of the clip in memory, so use it on short clips (a few seconds to a minute, less at 4K), and the paused preview of a long reversed clip can be slow. Freeze frames are silent. Images and titles cannot be sped up (their length is set directly).
 - **Zoom** uses the first Zoom effect on a clip. Zooming in past 1x crops the picture; zooming out below 1x or moving the focus to an edge can reveal black background. The zoom is applied after other effects, and combines (multiplies) with scale keyframes.
-- **Not included:** multicam editing, planar tracking (single-point tracking is included), particle systems, 3D compositing and camera solve, optical-flow retiming beyond FFmpeg's interpolation, RAW camera formats, XML / AAF round-trips, DCP / IMF, watch folders, render farms and project collaboration. These are large features that FFmpeg cannot supply on its own.
+- **Not included (cannot be done with FFmpeg and this app alone):** AAF export or import; DCP and IMF packaging; camera RAW video (ARRIRAW, Blackmagic RAW, REDCODE); a true 3D scene with camera solve (the 3D effect is a flat plane, tracking is 2D); a networked render farm (watch folders render on one machine); cloud sync, shared libraries and live collaboration (locking and version history work on a shared or synced folder only). Retiming beyond FFmpeg's frame interpolation is also not included.
 - Shuttle playback keyframes and subtitles keep their normal timing, so they appear slightly off while playing at other than 1x. Audio is sped up with the picture.
 - Proxies are for preview only. Loudness measurement and range export use the originals.
 - Keyframe times are relative to the clip start. Trimming a clip's left edge does not shift them. Splitting a clip keeps animation continuous.
@@ -147,5 +156,6 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 - The title box outline on the preview is an estimate of the text size; FFmpeg does the real layout. Wrapping inside a fixed-width box uses an average character width, so line breaks can differ slightly from a true font measurement.
 - Opacity keyframes use FFmpeg's `geq` filter, which is slow at 4K. Prefer a fade transition when you only need a fade.
 - No audio transitions or effects beyond fades; no on-canvas dragging of clips.
+- **Multicam sync** needs the cameras to have recorded the same sound; it compares from the start of each source file. Particle and watch-folder features are new and have had little real-world use.
 - Export builds one FFmpeg command; very large timelines (hundreds of clips) can hit the Windows command-line length limit.
 - Bundling FFmpeg builds with x264/x265 makes your distribution subject to the GPL.

@@ -335,6 +335,43 @@ pub enum Effect {
     Stabilize { strength: f32 },
     /// Soft-edged rectangle or ellipse mask (all values as fractions of the picture).
     Mask { ellipse: bool, cx: f32, cy: f32, w: f32, h: f32, feather: f32, invert: bool },
+    /// 2.5D transform: turn the layer about its centre (degrees) with camera perspective (0 = flat).
+    Transform3D { rx: f32, ry: f32, rz: f32, persp: f32 },
+    /// Pin the layer's corners (TL, TR, BR, BL; fractions of the canvas). With `track`, the corners
+    /// move over time (times are seconds from the start of the clip).
+    CornerPin { pts: [[f32; 2]; 4], track: Vec<PinKey> },
+}
+
+/// Corner positions at one moment of a corner-pin track.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct PinKey {
+    pub t: f64,
+    pub pts: [[f32; 2]; 4],
+}
+
+/// Where the corners of a unit rectangle land after a 3D turn, as fractions of the frame
+/// (TL, TR, BR, BL). Scaled so the result always fits inside the frame.
+pub fn transform3d_corners(rx: f32, ry: f32, rz: f32, persp: f32) -> [[f32; 2]; 4] {
+    let (ax, ay, az) = (rx.to_radians(), ry.to_radians(), rz.to_radians());
+    let d = 1.0 / persp.clamp(0.0, 1.0).max(0.02); // camera distance (in half-heights); flat when persp=0
+    let flat = persp <= 0.0;
+    let aspect = 16.0 / 9.0_f32;
+    let mut out = [[0.0f32; 2]; 4];
+    for (i, (sx, sy)) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].iter().enumerate() {
+        let (x, y, z) = (sx * aspect, *sy, 0.0f32);
+        // rotate about Z, then X, then Y
+        let (x1, y1) = (x * az.cos() - y * az.sin(), x * az.sin() + y * az.cos());
+        let (y2, z2) = (y1 * ax.cos() - z * ax.sin(), y1 * ax.sin() + z * ax.cos());
+        let (x3, z3) = (x1 * ay.cos() + z2 * ay.sin(), -x1 * ay.sin() + z2 * ay.cos());
+        let k = if flat { 1.0 } else { d / (d + z3).max(0.2) };
+        out[i] = [x3 * k, y2 * k];
+    }
+    let ext = out.iter().flat_map(|p| [p[0].abs() / aspect, p[1].abs()]).fold(1e-3f32, f32::max);
+    for p in out.iter_mut() {
+        p[0] = 0.5 + 0.5 * p[0] / aspect / ext.max(1.0);
+        p[1] = 0.5 + 0.5 * p[1] / ext.max(1.0);
+    }
+    out
 }
 
 impl Effect {
@@ -365,6 +402,8 @@ impl Effect {
             Effect::Denoise { strength: 4.0 },
             Effect::Stabilize { strength: 16.0 },
             Effect::Mask { ellipse: true, cx: 0.5, cy: 0.5, w: 0.6, h: 0.6, feather: 0.15, invert: false },
+            Effect::Transform3D { rx: 0.0, ry: 30.0, rz: 0.0, persp: 0.4 },
+            Effect::CornerPin { pts: [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]], track: vec![] },
         ]
     }
     pub fn label(&self) -> &'static str {
@@ -399,6 +438,8 @@ impl Effect {
             Effect::Denoise { .. } => "Video denoise",
             Effect::Stabilize { .. } => "Stabilize",
             Effect::Mask { .. } => "Mask (shape, feather)",
+            Effect::Transform3D { .. } => "3D rotate (perspective)",
+            Effect::CornerPin { .. } => "Corner pin",
         }
     }
 }
@@ -505,6 +546,65 @@ impl AnimPreset {
                 a.opacity = vec![kf(0.0, 0.0, Ease::Out), kf(e, 1.0, Ease::Linear)];
             }
         }
+    }
+}
+
+/// Kinds of procedural particle clips.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+pub enum ParticleKind {
+    #[default]
+    Snow,
+    Rain,
+    Sparks,
+    Confetti,
+    Fireflies,
+}
+
+impl ParticleKind {
+    pub const ALL: [ParticleKind; 5] = [ParticleKind::Snow, ParticleKind::Rain, ParticleKind::Sparks, ParticleKind::Confetti, ParticleKind::Fireflies];
+    pub fn label(self) -> &'static str {
+        match self {
+            ParticleKind::Snow => "Snow",
+            ParticleKind::Rain => "Rain",
+            ParticleKind::Sparks => "Sparks",
+            ParticleKind::Confetti => "Confetti",
+            ParticleKind::Fireflies => "Fireflies",
+        }
+    }
+}
+
+/// A generated particle layer (no source file). Every frame is a pure function of time and seed,
+/// so any part of the clip can be rendered independently.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct ParticleSpec {
+    pub kind: ParticleKind,
+    pub count: u32,
+    /// Motion speed multiplier.
+    pub speed: f32,
+    /// Particle size multiplier.
+    pub size: f32,
+    pub seed: u32,
+    /// Tint (ignored for confetti, which is multicoloured).
+    pub color: [u8; 3],
+}
+
+impl ParticleSpec {
+    pub fn new(kind: ParticleKind) -> Self {
+        let color = match kind {
+            ParticleKind::Snow => [255, 255, 255],
+            ParticleKind::Rain => [190, 210, 255],
+            ParticleKind::Sparks => [255, 170, 60],
+            ParticleKind::Confetti => [255, 255, 255],
+            ParticleKind::Fireflies => [230, 255, 120],
+        };
+        let count = match kind {
+            ParticleKind::Snow => 160,
+            ParticleKind::Rain => 220,
+            ParticleKind::Sparks => 90,
+            ParticleKind::Confetti => 120,
+            ParticleKind::Fireflies => 40,
+        };
+        Self { kind, count, speed: 1.0, size: 1.0, seed: 1, color }
     }
 }
 
@@ -808,6 +908,9 @@ pub struct Clip {
     /// Generated text clip. `media_id` is 0 for these.
     #[serde(default)]
     pub title: Option<TitleSpec>,
+    /// Generated particle layer. `media_id` is 0 for these.
+    #[serde(default)]
+    pub particles: Option<ParticleSpec>,
     /// Playback speed (1.0 = normal). The clip covers `duration * speed` seconds of source.
     #[serde(default = "one")]
     pub speed: f64,
@@ -831,6 +934,10 @@ pub struct Clip {
 }
 
 impl Clip {
+    /// True for clips that have no source file (titles, particles).
+    pub fn generated(&self) -> bool {
+        self.title.is_some() || self.particles.is_some()
+    }
     pub fn end(&self) -> f64 {
         self.start + self.duration
     }
@@ -867,6 +974,7 @@ impl Clip {
             effects: vec![],
             anim: Anim::default(),
             title: None,
+            particles: None,
             speed: 1.0,
             reverse: false,
             freeze: false,
@@ -1072,6 +1180,17 @@ impl Project {
         id
     }
 
+    pub fn add_particles(&mut self, track: usize, start: f64, spec: ParticleSpec) -> u64 {
+        let track = track.min(self.tracks.len().saturating_sub(1));
+        let dur = 6.0;
+        let start = self.nearest_free(track, start, dur, None);
+        let id = self.alloc_id();
+        let mut c = Clip::new(id, 0, track, start, 0.0, dur);
+        c.particles = Some(spec);
+        self.clips.push(c);
+        id
+    }
+
     /// Split a clip at timeline time `t`. Returns the id of the new right-hand clip.
     pub fn split(&mut self, clip_id: u64, t: f64) -> Option<u64> {
         let c = self.clip(clip_id)?.clone();
@@ -1112,6 +1231,7 @@ impl Project {
         right.volume = c.volume;
         right.effects = c.effects.clone();
         right.title = c.title.clone();
+        right.particles = c.particles.clone();
         right.anim = anim_r;
         right.transition_out = c.transition_out;
         right.audio_fade_out = c.audio_fade_out;
@@ -1133,7 +1253,7 @@ impl Project {
     /// is placed in the gap. Returns the id of the freeze clip.
     pub fn insert_freeze(&mut self, clip_id: u64, t: f64, dur: f64) -> Option<u64> {
         let c = self.clip(clip_id)?.clone();
-        if c.title.is_some() || c.freeze || dur <= 0.0 {
+        if c.generated() || c.freeze || dur <= 0.0 {
             return None;
         }
         let kind = self.media(c.media_id)?.kind;
@@ -1176,7 +1296,7 @@ impl Project {
     /// Splits the clip as needed and ripples later clips on the track. Returns the middle clip id.
     pub fn apply_speed_range(&mut self, clip_id: u64, t0: f64, t1: f64, speed: f64) -> Option<u64> {
         let c = self.clip(clip_id)?.clone();
-        if c.title.is_some() || c.freeze || self.media(c.media_id).map_or(true, |m| m.kind == MediaKind::Image) {
+        if c.generated() || c.freeze || self.media(c.media_id).map_or(true, |m| m.kind == MediaKind::Image) {
             return None;
         }
         let speed = speed.clamp(0.1, 16.0);
@@ -1205,7 +1325,7 @@ impl Project {
     // ------------------------------------------------------------------ edit operations
 
     fn is_stills(&self, c: &Clip) -> bool {
-        c.freeze || c.title.is_some() || self.media(c.media_id).map_or(true, |m| m.kind == MediaKind::Image)
+        c.freeze || c.generated() || self.media(c.media_id).map_or(true, |m| m.kind == MediaKind::Image)
     }
 
     /// Timeline seconds a clip can still grow at its (start edge, end edge) before running out
@@ -1453,6 +1573,49 @@ impl Project {
         Some(id)
     }
 
+    /// Multicam: align angle clips using audio lags (`lags[i]` = how much later the shared event
+    /// happens in angle i's media than in the first angle's, i.e. `sync::media_offset(first, i).0`
+    /// negated). Angle 0 stays put; everything else moves. If anything would start before 0 the
+    /// whole group is shifted right. Returns false if a clip id is unknown.
+    pub fn multicam_align(&mut self, angles: &[u64], lag_vs_first: &[f64]) -> bool {
+        if angles.len() < 2 || angles.len() != lag_vs_first.len() {
+            return false;
+        }
+        let Some(a) = self.clip(angles[0]).cloned() else { return false };
+        // media_offset(a, b) = lag: event later in a than in b. b.start = a.start - a.in + b.in + lag
+        let mut starts = vec![a.start];
+        for (i, id) in angles.iter().enumerate().skip(1) {
+            let Some(b) = self.clip(*id) else { return false };
+            starts.push(a.start - a.in_point + b.in_point + lag_vs_first[i]);
+        }
+        let shift = starts.iter().cloned().fold(0.0f64, |m, s| m.min(s)).abs();
+        for (id, st) in angles.iter().zip(starts) {
+            if let Some(c) = self.clips.iter_mut().find(|c| c.id == *id) {
+                c.start = (st + shift).max(0.0);
+            }
+        }
+        true
+    }
+
+    /// Multicam: from `t` to the end of the angle clip, overwrite `program_track` with the same
+    /// moment of `angle`. Later cuts overwrite the remainder, like switching live.
+    pub fn multicam_cut(&mut self, angle: u64, program_track: usize, t: f64) -> Option<u64> {
+        let a = self.clip(angle)?.clone();
+        if a.generated() || a.freeze || a.reverse || (a.speed - 1.0).abs() > 1e-6 {
+            return None; // keep it exact: only plain angle clips
+        }
+        let end = a.start + a.duration;
+        if t < a.start - 1e-6 || t >= end - 0.05 {
+            return None;
+        }
+        let src_in = a.in_point + (t - a.start);
+        let id = self.add_subclip(a.media_id, program_track, t, src_in, a.in_point + a.duration, true)?;
+        if let Some(c) = self.clips.iter_mut().find(|c| c.id == id) {
+            c.volume = a.volume;
+        }
+        Some(id)
+    }
+
     /// Speed ramp: change speed gradually from `s0` to `s1` across `t0..t1` of a clip, in
     /// `steps` pieces (smooth velocity curve). Returns false if the range is not usable.
     pub fn speed_ramp(&mut self, clip_id: u64, t0: f64, t1: f64, s0: f64, s1: f64, steps: usize) -> bool {
@@ -1532,7 +1695,7 @@ impl Project {
         for c in p.clips.iter_mut() {
             if c.end() > len {
                 let cut = c.end() - len;
-                let still = c.freeze || c.title.is_some() || self.media(c.media_id).map_or(true, |m| m.kind == MediaKind::Image);
+                let still = c.freeze || c.generated() || self.media(c.media_id).map_or(true, |m| m.kind == MediaKind::Image);
                 if c.reverse && !still {
                     c.in_point += cut * c.speed;
                 }
