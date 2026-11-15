@@ -11,6 +11,8 @@ A lightweight timeline video editor for Windows, written in Rust. Layout is as f
 
 The finished program is in the following folder: `target\release\reelforge.exe`.
 
+The release build uses full link-time optimisation, so the last step (compiling ReelForge itself) can take 5 to 15 minutes on one CPU core with little output. For quicker test builds use `cargo build --profile fast`; the program is then in `target\fast\` (copy ffmpeg there too).
+
 ## How it works
 
 - UI: `egui`/`eframe` (GPU-rendered, small binary, no web runtime).

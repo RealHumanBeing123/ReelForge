@@ -19,3 +19,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Quicker local builds: `cargo build --profile fast` (output in target\fast\). Slightly larger
+# and a little slower at runtime than `--release`, but compiles several times faster.
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
