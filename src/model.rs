@@ -1700,6 +1700,9 @@ impl Project {
                     c.in_point += cut * c.speed;
                 }
                 c.duration = len - c.start;
+                // the clip carries on past this cut, so it must not fade out here
+                c.transition_out = Transition::default();
+                c.audio_fade_out = 0.0;
             }
         }
         p.subtitles.retain(|s| s.start < len);

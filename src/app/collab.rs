@@ -54,7 +54,7 @@ impl Collab {
     }
 }
 
-fn who() -> String {
+pub(super) fn who() -> String {
     let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "someone".into());
     let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "this computer".into());
     format!("{user}@{host}")

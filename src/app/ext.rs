@@ -247,6 +247,14 @@ pub struct Config {
     pub watch_render: String,
     #[serde(default)]
     pub watch_preset: String,
+    #[serde(default)]
+    pub farm_dir: String,
+    #[serde(default)]
+    pub farm_worker: bool,
+    #[serde(default)]
+    pub raw_cmd: String,
+    #[serde(default)]
+    pub raw_ext: String,
 }
 
 fn yes() -> bool {
@@ -255,7 +263,7 @@ fn yes() -> bool {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], export_presets: vec![], render_rate: 0.0, show_media: true, show_props: true, watch_on: false, watch_media: String::new(), watch_render: String::new(), watch_preset: String::new() }
+        Self { shortcuts: HashMap::new(), macros: vec![], fx_presets: vec![], export_presets: vec![], render_rate: 0.0, show_media: true, show_props: true, watch_on: false, watch_media: String::new(), watch_render: String::new(), watch_preset: String::new(), farm_dir: String::new(), farm_worker: false, raw_cmd: String::new(), raw_ext: String::new() }
     }
 }
 
@@ -665,6 +673,7 @@ impl ReelForge {
 
     pub(super) fn ext_poll(&mut self, ctx: &egui::Context) {
         self.collab_poll(ctx);
+        self.farm_poll(ctx);
         // deferred edits from the properties panel
         if let Some(a) = self.ext.action.take() {
             match a {
@@ -845,6 +854,14 @@ impl ReelForge {
             }
             if ui.button("Version history...").clicked() {
                 self.collab.versions_open = true;
+                ui.close_menu();
+            }
+            if ui.button("Render farm...").clicked() {
+                self.farm.open = true;
+                ui.close_menu();
+            }
+            if ui.button("RAW converter...").clicked() {
+                self.farm.raw_open = true;
                 ui.close_menu();
             }
             if ui.button("Watch folders...").clicked() {
@@ -1238,6 +1255,8 @@ impl ReelForge {
         self.win_planar(ctx);
         self.win_versions(ctx);
         self.win_watch(ctx);
+        self.win_farm(ctx);
+        self.win_raw(ctx);
     }
 
     fn win_shortcuts(&mut self, ctx: &egui::Context) {

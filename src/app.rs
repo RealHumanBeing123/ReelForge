@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod collab;
+mod farmui;
 mod ext;
 
 const TRACK_H: f32 = 54.0;
@@ -57,6 +58,8 @@ const MEDIA_EXTS: &[&str] = &[
     "mp3", "wav", "flac", "aac", "m4a", "ogg", "oga", "opus", "wma", "aiff", "aif",
     // images
     "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "exr", "dpx", "dng", "tga", "jp2",
+    // camera RAW (converted first with the tool set in Tools > RAW converter)
+    "braw", "r3d", "ari", "arx", "crm", "nev", "rmf", "cine",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,6 +115,7 @@ pub struct ReelForge {
     edit_stamp: Option<(u64, Instant)>,
     ext: ext::Ext,
     collab: collab::Collab,
+    farm: farmui::Farm,
     track_pick: bool,
     track_pt: (f32, f32),
     track_rx: Option<Receiver<Result<(u64, f64, Vec<TrackPoint>), String>>>,
@@ -212,6 +216,7 @@ impl ReelForge {
             edit_stamp: None,
             ext: ext::Ext::load(),
             collab: collab::Collab::new(),
+            farm: farmui::Farm::new(),
             track_pick: false,
             track_pt: (0.5, 0.5),
             track_rx: None,
@@ -541,7 +546,22 @@ impl ReelForge {
         let tx = self.probe_tx.clone();
         let ctx = ctx.clone();
         self.status = format!("Importing {}...", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        let raw_cmd = self.ext.cfg.raw_cmd.clone();
+        let raw_ext = if self.ext.cfg.raw_ext.trim().is_empty() { "mov".to_string() } else { self.ext.cfg.raw_ext.trim().trim_start_matches('.').to_string() };
         std::thread::spawn(move || {
+            let mut path = path;
+            if crate::raw::is_raw(&path) {
+                // FFmpeg cannot read camera RAW: convert it with the user's own tool first
+                let dir = std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("ReelForge")).unwrap_or_else(std::env::temp_dir).join("raw");
+                let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
+                let out = dir.join(format!("{stem}.{raw_ext}"));
+                if let Err(e) = crate::raw::convert(&raw_cmd, &path, &out) {
+                    let _ = tx.send(Err(format!("{}: {e}", path.display())));
+                    ctx.request_repaint();
+                    return;
+                }
+                path = out;
+            }
             let r = probe::probe(&path).map_err(|e| format!("{}: {e:#}", path.display()));
             let _ = tx.send(r);
             ctx.request_repaint();

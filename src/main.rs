@@ -8,6 +8,8 @@ mod playback;
 mod preview;
 mod probe;
 mod record;
+mod farm;
+mod raw;
 mod render;
 mod scopes;
 mod sync;
