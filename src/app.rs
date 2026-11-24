@@ -1395,7 +1395,7 @@ impl ReelForge {
                         }
                         if !c.generated() && !c.freeze {
                             egui::CollapsingHeader::new("Edit tools").id_salt("edittools").default_open(false).show(ui, |ui| {
-                                let mut nudge = |ui: &mut egui::Ui, label: &str, hint: &str, mk: &dyn Fn(f64) -> Option<ext::ExtAction>, pending: &mut Option<ext::ExtAction>| {
+                                let nudge = |ui: &mut egui::Ui, label: &str, hint: &str, mk: &dyn Fn(f64) -> Option<ext::ExtAction>, pending: &mut Option<ext::ExtAction>| {
                                     ui.horizontal(|ui| {
                                         ui.label(label).on_hover_text(hint);
                                         for (txt, d) in [("-1 s", -1.0), ("-1 fr", -fr), ("+1 fr", fr), ("+1 s", 1.0)] {
@@ -1900,7 +1900,7 @@ impl ReelForge {
         while tx(t, scroll) < rect.right() {
             let x = tx(t, scroll);
             if x >= lane_left {
-                lane_painter.line_segment([Pos2::new(x, ruler.bottom() - 8.0), Pos2::new(x, ruler.bottom())], Stroke::new(1.0, Color32::GRAY));
+                lane_painter.line_segment([Pos2::new(x, ruler.bottom() - 8.0), Pos2::new(x, ruler.bottom())], Stroke::new(1.0_f32, Color32::GRAY));
                 lane_painter.text(Pos2::new(x + 3.0, ruler.top() + 8.0), Align2::LEFT_CENTER, fmt_time(t), FontId::monospace(10.0), Color32::GRAY);
             }
             t += step;
@@ -1929,7 +1929,7 @@ impl ReelForge {
             if let Some(t) = v {
                 let x = tx(t, scroll);
                 if x >= lane_left && x <= rect.right() {
-                    lane_painter.line_segment([Pos2::new(x, ruler.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, Color32::from_rgb(90, 170, 255)));
+                    lane_painter.line_segment([Pos2::new(x, ruler.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0_f32, Color32::from_rgb(90, 170, 255)));
                     lane_painter.text(Pos2::new(x + 2.0, ruler.top() + 20.0), Align2::LEFT_CENTER, label, FontId::proportional(10.0), Color32::from_rgb(120, 190, 255));
                 }
             }
@@ -1937,7 +1937,7 @@ impl ReelForge {
         for mk in &self.project.markers {
             let x = tx(mk.t, scroll);
             if x >= lane_left && x <= rect.right() {
-                lane_painter.line_segment([Pos2::new(x, ruler.bottom()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 170, 60, 110)));
+                lane_painter.line_segment([Pos2::new(x, ruler.bottom()), Pos2::new(x, rect.bottom())], Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 170, 60, 110)));
                 lane_painter.add(egui::Shape::convex_polygon(
                     vec![Pos2::new(x - 5.0, ruler.top() + 1.0), Pos2::new(x + 5.0, ruler.top() + 1.0), Pos2::new(x, ruler.top() + 9.0)],
                     Color32::from_rgb(255, 170, 60),
@@ -1957,7 +1957,7 @@ impl ReelForge {
             self.track_rects.push((ti, row_rect));
             let shade = if row % 2 == 0 { Color32::from_rgb(33, 35, 40) } else { Color32::from_rgb(30, 32, 36) };
             painter.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), top), Vec2::new(rect.width(), TRACK_H)), 0.0, shade);
-            painter.line_segment([Pos2::new(rect.left(), top + TRACK_H), Pos2::new(rect.right(), top + TRACK_H)], Stroke::new(1.0, Color32::from_gray(20)));
+            painter.line_segment([Pos2::new(rect.left(), top + TRACK_H), Pos2::new(rect.right(), top + TRACK_H)], Stroke::new(1.0_f32, Color32::from_gray(20)));
 
             // header
             let tr = &self.project.tracks[ti];
@@ -1974,7 +1974,7 @@ impl ReelForge {
                 }
             }
         }
-        painter.line_segment([Pos2::new(lane_left, rect.top()), Pos2::new(lane_left, rect.bottom())], Stroke::new(1.0, Color32::from_gray(15)));
+        painter.line_segment([Pos2::new(lane_left, rect.top()), Pos2::new(lane_left, rect.bottom())], Stroke::new(1.0_f32, Color32::from_gray(15)));
 
         // click on empty lane area deselects
         let lanes_rect = Rect::from_min_max(Pos2::new(lane_left, rect.top() + RULER_H), rect.max);
@@ -2058,10 +2058,10 @@ impl ReelForge {
                 lane_painter.add(egui::Shape::convex_polygon(
                     vec![Pos2::new(x, y - d), Pos2::new(x + d, y), Pos2::new(x, y + d), Pos2::new(x - d, y)],
                     Color32::from_rgb(255, 215, 90),
-                    Stroke::new(1.0, Color32::BLACK),
+                    Stroke::new(1.0_f32, Color32::BLACK),
                 ));
             }
-            lane_painter.rect_stroke(r, 4.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { Color32::from_rgb(255, 210, 80) } else { Color32::from_black_alpha(120) }));
+            lane_painter.rect_stroke(r, 4.0, Stroke::new(if sel { 2.0_f32 } else { 1.0_f32 }, if sel { Color32::from_rgb(255, 210, 80) } else { Color32::from_black_alpha(120) }));
 
             let vis = r.intersect(lanes_rect);
             if vis.width() < 2.0 {
@@ -2107,7 +2107,7 @@ impl ReelForge {
             if let Some(p) = pointer {
                 for (_, r) in &self.track_rects {
                     if r.contains(p) {
-                        painter.rect_stroke(r.shrink(1.0), 2.0, Stroke::new(2.0, Color32::from_rgb(255, 210, 80)));
+                        painter.rect_stroke(r.shrink(1.0), 2.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 210, 80)));
                     }
                 }
             }
@@ -2118,7 +2118,7 @@ impl ReelForge {
             let mx = tx(mt, scroll);
             if mx >= lane_left && mx <= rect.right() {
                 let gold = Color32::from_rgb(255, 215, 90);
-                painter.line_segment([Pos2::new(mx, rect.top()), Pos2::new(mx, rect.bottom())], Stroke::new(1.0, gold));
+                painter.line_segment([Pos2::new(mx, rect.top()), Pos2::new(mx, rect.bottom())], Stroke::new(1.0_f32, gold));
                 painter.circle_filled(Pos2::new(mx, rect.top() + RULER_H - 6.0), 4.0, gold);
             }
         }

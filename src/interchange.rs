@@ -178,7 +178,7 @@ pub fn to_xmeml(project: &Project, title: &str) -> String {
     out.push_str("</samplecharacteristics></format>\n");
     let mut seen: Vec<u64> = vec![];
     let mut item_no = 0;
-    let mut file_xml = |m: &crate::model::MediaItem, seen: &mut Vec<u64>| -> String {
+    let file_xml = |m: &crate::model::MediaItem, seen: &mut Vec<u64>| -> String {
         if seen.contains(&m.id) {
             return format!("<file id=\"file-{}\"/>", m.id);
         }

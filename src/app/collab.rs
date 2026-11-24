@@ -23,7 +23,7 @@ pub struct Collab {
     imported: HashSet<PathBuf>,
     rendered: HashMap<PathBuf, SystemTime>,
     queue: VecDeque<(String, Project, RenderSettings)>,
-    job: Option<Job>,
+    pub(super) job: Option<Job>,
     pub log: VecDeque<String>,
 }
 
