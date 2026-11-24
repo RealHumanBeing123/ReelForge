@@ -95,10 +95,10 @@ Both recorders offer the same encoding options as Export: container, resolution,
 
 - **Record screen:**
   - Capture the entire desktop, a region (X / Y / width / height), or a single window (by its exact title bar text).
-  - Optional mouse cursor, microphone, and system audio (mixed together when both are chosen).
+  - Optional mouse cursor, any **microphone / input device**, and any **output device's sound** (everything Windows plays through it); both are mixed when both are chosen.
   - Resolution can be **Native** or 480p-2160p. Recordings are only ever scaled **down**, never up.
   - A 3-second countdown starts the recording. ReelForge can minimise itself while recording; restore it from the taskbar and press **Stop**.
-  - MP4/MOV recordings are written as fragmented MP4, so a crash or power loss still leaves a playable file.
+  - MP4/MOV recordings are written as fragmented MP4, so a crash or power loss still leaves a playable picture file. When sound is recorded the picture is saved first (as `<name>__picture`) and the sound is added when you stop; if that final step fails the picture file is kept.
 - **Record voice:** pick a microphone and an audio codec (AAC, MP3, Opus, Vorbis, FLAC, WAV) and bitrate.
 - Files are auto-named in `Videos\ReelForge Recordings` unless you choose a location. Finished recordings are imported into the media bin and, optionally, added to the timeline at the playhead.
 
@@ -144,7 +144,7 @@ MP4 / MKV / MOV / WebM; H.264, H.265, VP9, AV1, ProRes, plus NVENC / AMF / QSV h
 ## Known limitations (v0.8)
 
 - **This code has not been compiled or run on Windows by its author.** The FFmpeg commands it generates (export, preview, titles, recordings) were tested against FFmpeg 6.1 on Linux with synthetic inputs; the egui interface and the Windows capture devices (`gdigrab`, DirectShow) have not. Expect to fix a few compile errors on the first build.
-- Screen and voice recording use FFmpeg's `gdigrab` and DirectShow, so they work on Windows only. System-audio capture needs a loopback device such as "Stereo Mix", which many PCs have disabled by default.
+- Screen recording uses FFmpeg's `gdigrab` for the picture, so it works on Windows only. Sound is captured separately through Windows audio (WASAPI): the *Microphone* list shows every input device, and *System audio (output)* lists every output device (speakers, headphones, HDMI, Bluetooth, virtual cables) and records whatever Windows plays through it, so no "Stereo Mix" is needed. The sound and picture are joined when you stop, which can take a few seconds. Their start times can differ by a fraction of a second, so check the first clap or click and use *Sound timing* (ms) to correct it. Protected audio (some DRM streams) may record as silence. This sound capture has not been run on real hardware.
 - ReelForge's own window is captured if you do not minimise it while recording a desktop or region.
 - Preview playback streams from FFmpeg with mixed audio through `rodio`. Audio and video start together but are not sample-locked, so expect small drift on long playbacks. Full HD preview can drop frames on slower machines.
 - Editing, seeking or stepping while playing stops playback.

@@ -145,6 +145,7 @@ pub struct ReelForge {
     screen_opts: ScreenOptions,
     voice_mic: Option<String>,
     audio_devices: Vec<String>,
+    output_devices: Vec<String>,
     devices_loaded: bool,
     recorder: Option<(RecKind, Recorder)>,
     rec_countdown: Option<Instant>,
@@ -244,6 +245,7 @@ impl ReelForge {
             screen_opts: ScreenOptions::default(),
             voice_mic: None,
             audio_devices: vec![],
+            output_devices: vec![],
             devices_loaded: false,
             recorder: None,
             rec_countdown: None,
@@ -2253,32 +2255,61 @@ impl ReelForge {
     // ---------------------------------------------------------------- UI: export window
 
     fn refresh_devices(&mut self) {
-        self.audio_devices = record::list_audio_devices();
+        let d = crate::capture::list_devices();
+        self.audio_devices = d.inputs;
+        self.output_devices = d.outputs;
         self.devices_loaded = true;
+        let (def_in, _) = crate::capture::default_names();
         if self.voice_mic.is_none() {
-            self.voice_mic = self.audio_devices.first().cloned();
+            self.voice_mic = def_in.or_else(|| self.audio_devices.first().cloned());
         }
     }
 
     fn begin_recording(&mut self, ctx: &egui::Context, kind: RecKind) {
         self.rec_msg.clear();
-        let built = match kind {
+        let tmp = std::env::temp_dir().join("ReelForge");
+        let _ = std::fs::create_dir_all(&tmp);
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        // (ffmpeg arguments for the picture, final file, sound sources + mixing plan)
+        let built: Result<(Option<Vec<String>>, PathBuf, Option<(Option<String>, Option<String>, record::MuxPlan)>), String> = match kind {
             RecKind::Screen => {
                 let mut st = self.rec_screen.clone();
                 st.normalize();
                 let out = st.output.clone().unwrap_or_else(|| record::default_output("Screen", st.container.ext()));
-                record::screen_args(&self.screen_opts, &st, &out).map(|a| (a, out))
+                let (mic, sys) = (self.screen_opts.mic.clone(), self.screen_opts.system_audio.clone());
+                if mic.is_none() && sys.is_none() {
+                    record::screen_video_args(&self.screen_opts, &st, &out).map(|a| (Some(a), out, None))
+                } else {
+                    let video = out.with_file_name(format!("{}__picture.{}", out.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "rec".into()), st.container.ext()));
+                    record::screen_video_args(&self.screen_opts, &st, &video).map(|a| {
+                        let plan = record::MuxPlan { video: Some(video), settings: st.clone(), out: out.clone(), offset: self.screen_opts.audio_offset_ms as f64 / 1000.0 };
+                        (Some(a), out, Some((mic, sys, plan)))
+                    })
+                }
             }
             RecKind::Voice => {
                 let st = self.rec_voice.clone();
                 let ext = record::audio_ext(st.acodec);
                 let mut out = st.output.clone().unwrap_or_else(|| record::default_output("Voice", ext));
                 out.set_extension(ext);
-                record::voice_args(self.voice_mic.as_deref().unwrap_or(""), &st, &out).map(|a| (a, out))
+                match self.voice_mic.clone() {
+                    Some(m) => Ok((None, out.clone(), Some((Some(m), None, record::MuxPlan { video: None, settings: st, out, offset: 0.0 })))),
+                    None => Err("Choose a microphone.".to_string()),
+                }
             }
         };
+        let built = built.and_then(|(args, out, snd)| {
+            let (audio, plan) = match snd {
+                Some((mic, sys, plan)) => {
+                    let cap = crate::capture::AudioCapture::start(mic.as_deref(), sys.as_deref(), &tmp, &format!("rec_{stamp}"))?;
+                    (Some(Box::new(cap) as Box<dyn record::AudioSource>), Some(plan))
+                }
+                None => (None, None),
+            };
+            Ok((args, out, audio, plan))
+        });
         match built {
-            Ok((args, out)) => match Recorder::start(&args, out) {
+            Ok((args, out, audio, plan)) => match Recorder::start(args.as_deref(), out, audio, plan) {
                 Ok(r) => self.recorder = Some((kind, r)),
                 Err(e) => {
                     self.rec_msg = e;
@@ -2367,13 +2398,18 @@ impl ReelForge {
                     ui.checkbox(&mut self.screen_opts.draw_mouse, "Show mouse cursor");
                     ui.add_space(4.0);
                     device_combo(ui, "Microphone", "rec_mic", &mut self.screen_opts.mic, &self.audio_devices);
-                    device_combo(ui, "System audio", "rec_sys", &mut self.screen_opts.system_audio, &self.audio_devices);
+                    device_combo(ui, "System audio (output)", "rec_sys", &mut self.screen_opts.system_audio, &self.output_devices);
+                    ui.horizontal(|ui| {
+                        ui.label("Sound timing");
+                        ui.add(egui::DragValue::new(&mut self.screen_opts.audio_offset_ms).speed(5.0).range(-2000..=2000).suffix(" ms"));
+                        ui.label(egui::RichText::new("move sound later (+) or earlier (-) if it does not match the picture").weak().size(11.0));
+                    });
                     ui.horizontal(|ui| {
                         if ui.small_button("Refresh devices").clicked() {
                             refresh = true;
                         }
                     });
-                    ui.label(egui::RichText::new("System audio needs a loopback device such as \"Stereo Mix\" (enable it in Windows Sound settings > Recording).").weak().size(11.0));
+                    ui.label(egui::RichText::new("Pick the output (speakers, headphones, HDMI...) whose sound you want to capture; everything Windows plays through it is recorded. Microphones list every input device.").weak().size(11.0));
                     ui.checkbox(&mut self.rec_minimize, "Minimize ReelForge while recording (restore it from the taskbar to stop)");
                 } else {
                     device_combo(ui, "Microphone", "voice_mic", &mut self.voice_mic, &self.audio_devices);
